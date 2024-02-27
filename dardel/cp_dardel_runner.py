@@ -105,7 +105,15 @@ def set_permissions_recursive(path, permissions=0o777):
             os.chmod(os.path.join(dirpath, filename), permissions)
     logging.info(f"done set_permissions_recursive {path}")
 
+
 def run_cmd(cmd):
+    """
+    Execute a command (usually done in a separate thread)
+
+    Args:
+        cmd (str): The command line string to be executed by the system.
+
+    """
 
     logging.info(f"run_cmd {cmd}")
 
@@ -115,6 +123,7 @@ def run_cmd(cmd):
             logging.info(f"return becatce cmd is None or cmd.isspace()")
             return
 
+        # get parameters from cmd
         parts = cmd.split()
         index_data_file = parts.index('--data-file') + 1
         data_file = parts[index_data_file]
@@ -122,13 +131,15 @@ def run_cmd(cmd):
         index_output_dir = parts.index('-o') + 1
         output_dir = parts[index_output_dir]
 
+        # set up logging
         log_file_path = os.path.join(output_dir, 'cp.log')
 
+        # get images from this commands datafile
         image_list = parse_images_from_datafile(data_file)
         logging.debug(f'image_list {image_list}')
 
+        # stage images from this command
         stage_images(image_list)
-
 
         # check if finished file exists, then skip this command
         if os.path.exists(os.path.join(output_dir, "finished")):
