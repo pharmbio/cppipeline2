@@ -7,6 +7,8 @@ import subprocess
 import concurrent.futures
 import re
 
+
+
 import csv
 
 # Global list to track active subprocesses
@@ -25,11 +27,25 @@ def download_input_dir(input_dir):
     to_local_path = input_dir
     sync_with_rsync(from_remote_path, to_local_path)
 
+def download_results_dir(results_dir):
+    from_remote_path = f"guestserver:/share{results_dir}/*"
+    to_local_path = results_dir
+    sync_with_rsync(from_remote_path, to_local_path)
+
+def download_pipelines_dir(pipelines_dir):
+    from_remote_path = f"guestserver:/share{pipelines_dir}/*"
+    to_local_path = pipelines_dir
+    sync_with_rsync(from_remote_path, to_local_path)
+
 def sync_with_rsync(from_path, to_path):
     # Prepare the rsync command
     rsync_command = ["rsync", "-av", from_path, to_path]
 
     logging.info(f"rsync_command {rsync_command}")
+
+    # make sure to_path path exists
+    if not os.path.exists(to_path):
+        os.makedirs(to_path, exist_ok=True)
 
     # Execute the command
     result = subprocess.run(rsync_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -37,7 +53,7 @@ def sync_with_rsync(from_path, to_path):
 
 def sync_with_rsync_relative(from_path, to_path):
     # Prepare the rsync command
-    rsync_command = ["rsync", "-av","--relative", from_path, to_path]
+    rsync_command = ["rsync", "-av","--relative", "--no-perms", "--omit-dir-times", from_path, to_path]
 
     logging.info(f"rsync_command {rsync_command}")
 
@@ -68,7 +84,7 @@ def stage_images(image_list):
 def stage_files_with_scp(pathname_list, target_directory, remote_ssh_host_config):
     logging.info(f"inside stage_files_with_scp target_dir {target_directory} pathname_list {pathname_list}")
     if not os.path.exists(target_directory):
-        os.makedirs(target_directory)
+        os.makedirs(target_directory, exist_ok=True)
 
     for image_path in pathname_list:
         local_path = os.path.join(target_directory, image_path) # save to local stage folder and preserve full filename
@@ -76,6 +92,7 @@ def stage_files_with_scp(pathname_list, target_directory, remote_ssh_host_config
 
         # Ensure the subdirectory structure for the local path exists
         local_subdir = os.path.dirname(local_path)
+        logging.info(f"local_subdir {local_subdir}")
         if not os.path.exists(local_subdir):
             os.makedirs(local_subdir)
 
@@ -192,6 +209,9 @@ try:
     input_dir = os.environ.get('INPUT_DIR')
     logging.info(f"input_dir {input_dir}")
 
+    results_dir = os.environ.get('RESULT_DIR')
+    logging.info(f"results_dir {results_dir}")
+
     max_workers = int(os.environ.get('MAX_WORKERS', default=16))
     logging.info(f"max_workers {max_workers}")
 
@@ -200,8 +220,16 @@ try:
 
     logging.info(f"OMP_NUM_THREADS {os.environ.get('OMP_NUM_THREADS')}")
 
+    pipelines_dir = "/cpp_work/pipelines"
+
     # download input dir
     download_input_dir(input_dir)
+
+    # download results dir
+    download_results_dir(results_dir)
+
+    # sync pipelines dir
+    download_pipelines_dir(pipelines_dir)
 
     # read all cellprofiler commands to be executed
     with open(f'{input_dir}/cmds.txt', 'r') as file:
