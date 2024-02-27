@@ -1,0 +1,17 @@
+version: "2.4"
+services:
+  cpp-master:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cppmaster2
+    restart: "no"
+    environment:
+      - DEBUG=$DEBUG
+      - DB_PASS=$DB_PASS
+    volumes:
+      - ./:/cpp # mount the pwd to the container
+      - /home/anders/.ssh/id_rsa:/root/.ssh/id_rsa
+      - /share/data2/cellprofiler/debug-automation:/cpp_work # mount the work and result nfs share from the fs of the dev node
+
+    command: ["python3", "/cpp/cpp_master_v2.py"]

@@ -1,0 +1,7 @@
+debug/*
+*.swp
+id_rsa*
+password*
+kube_config/*
+*configs.yaml
+*.sif
