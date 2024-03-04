@@ -225,8 +225,8 @@ try:
     # download input dir
     download_input_dir(input_dir)
 
-    # download results dir
-    download_results_dir(results_dir)
+    ## download results dir
+    #download_results_dir(results_dir)
 
     # sync pipelines dir
     download_pipelines_dir(pipelines_dir)
