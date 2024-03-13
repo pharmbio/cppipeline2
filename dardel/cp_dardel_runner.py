@@ -22,19 +22,14 @@ def sync_output_dir_to_remote(local_path):
     logging.info(f"to_remote_path {to_remote_path}")
     sync_with_rsync_relative(from_local_path, to_remote_path)
 
-def download_input_dir(input_dir):
+def sync_input_dir(input_dir):
     from_remote_path = f"guestserver:/share{input_dir}/*"
     to_local_path = input_dir
     sync_with_rsync(from_remote_path, to_local_path)
 
-def download_results_dir(results_dir):
+def sync_pipelines_dir(results_dir):
     from_remote_path = f"guestserver:/share{results_dir}/*"
     to_local_path = results_dir
-    sync_with_rsync(from_remote_path, to_local_path)
-
-def download_pipelines_dir(pipelines_dir):
-    from_remote_path = f"guestserver:/share{pipelines_dir}/*"
-    to_local_path = pipelines_dir
     sync_with_rsync(from_remote_path, to_local_path)
 
 def sync_with_rsync(from_path, to_path):
@@ -224,14 +219,11 @@ try:
 
     pipelines_dir = "/cpp_work/pipelines"
 
-    # download input dir
-    download_input_dir(input_dir)
-
-    # download results dir
-    download_results_dir(results_dir)
+    # sync input dir
+    sync_input_dir(input_dir)
 
     # sync pipelines dir
-    download_pipelines_dir(pipelines_dir)
+    sync_pipelines_dir(pipelines_dir)
 
     # read all cellprofiler commands to be executed
     with open(f'{input_dir}/cmds.txt', 'r') as file:
