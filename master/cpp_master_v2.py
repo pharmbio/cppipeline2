@@ -330,7 +330,7 @@ def is_debug():
 def load_cpp_config():
 
     if is_debug():
-        with open('/home/anders/projekt/cppipeline2/master/debug_configs.yaml', 'r') as configs_debug:
+        with open('debug_configs.yaml', 'r') as configs_debug:
             cpp_config = yaml.load(configs_debug, Loader=yaml.FullLoader)
 
     else:
