@@ -38,6 +38,9 @@ import time
 import pandas as pd
 import pyarrow
 import subprocess
+from database import Database
+from database import Analysis
+
 
 # divide a dict into smaller dicts with a set number of items in each
 def chunk_dict(data, chunk_size=1):
@@ -101,6 +104,7 @@ def check_analyses_finished(analyses):
 
 # function for making a cellprofiler formatted csv file
 def make_imgset_csv(imgsets, channel_map, storage_paths, use_icf):
+    logging.info("Inside make_imgset_csv")
 
     ### create header row
     header = ""
@@ -149,38 +153,46 @@ def make_imgset_csv(imgsets, channel_map, storage_paths, use_icf):
         # add filenames
         for img in sorted_imgset:
             img_filename = os.path.basename(img['path'])
-            row += f'\"{img_filename}\",'
+            row += f'"{img_filename}",'
 
         # add imgset info
-        row += f"{imgset_counter},1,{imgset_counter},\"{img['plate_barcode']}\",{img['site']},\"{img['well']}\",{img['plate_acquisition_id']},"
+        row += (
+            f'{imgset_counter},1,{imgset_counter},'
+            f'"{img["plate_barcode"]}",{img["site"]},'
+            f'"{img["well"]}",{img["plate_acquisition_id"]},'
+        )
 
         # add file paths
         for img in sorted_imgset:
             img_dirname = os.path.dirname(img['path'])
-            row += f'\"{img_dirname}\",'
+            row += f'"{img_dirname}",'
 
         # add file urls
         for img in sorted_imgset:
             path = img['path']
-            row += f'\"file:{path}\",'
+            row += f'"file:{path}",'
 
 
         # add illumination file names, both as URL_ and PATH_ - these are not uniqe per image,
         # all images with same channel have the same correction image
         if use_icf:
+
+            icf_path = storage_paths['full']
+
             # First as URL
             for ch_nr,ch_name in sorted(channel_map.items()):
-                path = f"{storage_paths['full']}/ICF_{ch_name}.npy"
-                row +=  f'\"file:{path}\",'
+                icf_file_name = f'ICF_{ch_name}.npy'
+                path = f'{icf_path}/{icf_file_name}'
+                row +=  f'"file:{path}",'
 
             # Also as PathName_
             for ch_nr,ch_name in sorted(channel_map.items()):
-                dir = f"{storage_paths['full']}"
-                row +=  f'"{dir}",'
+                row +=  f'"{icf_path}",'
 
             # Also as FileName_
             for ch_nr,ch_name in sorted(channel_map.items()):
-                row +=  f'\"ICF_{ch_name}.npy\",'
+                icf_file_name = f'ICF_{ch_name}.npy'
+                row +=  f'"{icf_file_name}",'
 
         # remove last comma and add a newline before adding it to the content
         content += row[:-1] + "\n"
@@ -312,24 +324,24 @@ def is_debug():
     if os.environ.get('DEBUG'):
         debug = True
 
-    #logging.info("debug=" + str(debug))
-
     return debug
 
 
 def load_cpp_config():
 
     if is_debug():
-        with open('/cpp/debug_configs.yaml', 'r') as configs_debug:
+        with open('/home/anders/projekt/cppipeline2/master/debug_configs.yaml', 'r') as configs_debug:
             cpp_config = yaml.load(configs_debug, Loader=yaml.FullLoader)
 
     else:
-        logging.error("only debug profile for now, exit here")
+        logging.error("Only debug profile for now, exit here")
         exit()
 
     cpp_config['postgres']['password'] = os.environ.get('DB_PASS')
 
-    # fetch uppmax config
+    # fetch config
+    cpp_config['dardel_user'] = cpp_config['dardel']['user']
+    cpp_config['dardel_hostname'] = cpp_config['dardel']['hostname']
     cpp_config['uppmax_user'] = cpp_config['uppmax']['user']
     cpp_config['uppmax_hostname'] = cpp_config['uppmax']['hostname']
 
@@ -342,7 +354,6 @@ def connect_db(cpp_config):
 
     # connect to the db
     logging.info("Connecting to db.")
-    logging.info(f"psw: {cpp_config['postgres']['password']}")
     connection = None
     connection = psycopg2.connect(  database=cpp_config['postgres']['db'],
                                     user=cpp_config['postgres']['user'],
@@ -361,50 +372,135 @@ def generate_random_identifier(length):
     return ''.join(random.SystemRandom().choice(string.ascii_lowercase + string.digits) for _ in range(length))
 
 
-def handle_new_jobs(cursor, connection, job_limit=None):
-
+def get_new_analyses(cursor):
     # ask for all new analyses
-    logging.info('Running analyses query.')
+    logging.info('Inside get_new_analyses')
     query = '''
              SELECT *
              FROM image_sub_analyses
              WHERE start IS NULL
              ORDER by priority, sub_id
             '''
-    logging.info(query)
+    logging.debug(query)
     cursor.execute(query)
 
     analyses = cursor.fetchall()
 
+    return analyses
+
+
+def handle_new_analyses(cursor, connection):
+    logging.info('Inside handle_new_jobs')
+
+    analyses = Database.get_instance().get_new_analyses()
+
+    #logging.debug(f'analyses {analyses}')
+
     # first run through all and check for unstarted on hpc (dardel)
     for analysis in analyses:
-        if analysis['meta']['type'] == 'cellprofiler':
-            if 'run_on_dardel' in analysis['meta'] and analysis['meta']['run_on_dardel'] == True:
-                logging.info(f'is dardel analysis: {analysis["analysis_id"]}')
+        if analysis.is_cellprofiler_analysis:
+            if analysis.is_run_on_dardel:
+                logging.debug(f'is dardel analysis: {analysis.analysis_id}')
                 # only run analyses that have satisfied dependencies
-                if all_dependencies_satisfied(analysis, cursor):
-                    handle_analysis_cellprofiler_dardel(analysis, cursor, connection, job_limit)
+                if all_dependencies_satisfied(analysis.raw_data, cursor):
+                    try:
+                        handle_analysis_cellprofiler_dardel(analysis.raw_data, cursor, connection)
+                    except Exception as e:
+                        logging.error("Exception", e)
+                        logging.warning(f"TODO: try to fail only this analysis {analysis.analysis_id}")
 
-def handle_analysis_cellprofiler_dardel(analysis, cursor, connection, job_limit=None):
-
-        logging.info("analysis: " + str(analysis))
-
-        analysis_id = analysis["analysis_id"]
-        sub_analysis_id = analysis["sub_id"]
-
-        # fetch the channel map for the acqusition
-        logging.info('Running channel map query.')
-        cursor.execute(f'''
+def get_channel_map(cursor, analysis):
+    cursor.execute(f'''
                             SELECT *
                             FROM channel_map
                             WHERE map_id=(SELECT channel_map_id
                                           FROM plate_acquisition
                                           WHERE id={analysis['plate_acquisition_id']})
-                           ''')
-        channel_map_res = cursor.fetchall()
-        channel_map = {}
-        for channel in channel_map_res:
-            channel_map[channel['channel']] = channel['dye']
+    ''')
+    channel_map_res = cursor.fetchall()
+    channel_map = {}
+    for channel in channel_map_res:
+        channel_map[channel['channel']] = channel['dye']
+
+    return channel_map
+
+def get_imgsets(cursor, acq_id, well_filter=None, site_filter=None):
+        # fetch all images belonging to the plate acquisition
+        logging.info('Fetching images belonging to plate acqusition.')
+
+        query = ("SELECT *"
+                 " FROM images_all_view"
+                 " WHERE plate_acquisition_id=%s")
+
+        if site_filter:
+            query += f' AND site IN ({ ",".join( map( str, site_filter )) }) '
+
+        if well_filter:
+            query += ' AND well IN (' + ','.join("'{0}'".format(w) for w in well_filter) + ")"
+
+
+        query += " ORDER BY timepoint, well, site, channel"
+
+        logging.info("query: " + query)
+
+        cursor.execute(query, (acq_id,))
+        imgs = cursor.fetchall()
+
+        imgsets = {}
+        img_infos = {}
+        for img in imgs:
+
+            logging.debug(f'img: {img["path"]}')
+            # readability
+            imgset_id = f"{img['well']}-{img['site']}"
+
+            # if it has been seen before
+            try:
+                imgsets[imgset_id] += [img['path']]
+                img_infos[imgset_id] += [img]
+            # if it has not been seen before
+            except KeyError:
+                imgsets[imgset_id] = [img['path']]
+                img_infos[imgset_id] = [img]
+
+        return imgsets, img_infos
+
+def handle_analysis_cellprofiler_dardel(analysis, cursor, connection):
+
+        analysis_id = analysis["analysis_id"]
+        sub_analysis_id = analysis["sub_id"]
+        sub_analysis_input_dir = f"/cpp_work/input/{sub_analysis_id}"
+
+        cmd = prepare_analysis_cellprofiler_dardel(analysis, cursor)
+
+        # write sbatch file to input dir (for debug and re-submit functionality)
+        sbatch_out_file = f"{sub_analysis_input_dir}/sbatch.sh"
+        logging.debug(f"sbatch_out_file: {sbatch_out_file}")
+        with open(sbatch_out_file, "w") as file:
+            file.write(cmd)
+
+        # submit sbatch job via ssh
+        job_id = exec_ssh_sbatch_cmd(cmd)
+
+        if job_id:
+            update_sub_analysis_status_to_db(connection, cursor, analysis_id, sub_analysis_id, f"submitted, job_id={job_id}")
+
+            # when all chunks of the sub analysis are sent in, mark the sub analysis as started
+            mark_analysis_as_started(cursor, connection, analysis['analysis_id'])
+            mark_sub_analysis_as_started(cursor, connection, analysis['sub_id'])
+
+
+def prepare_analysis_cellprofiler_dardel(analysis, cursor, ):
+
+        logging.info(f"Inside handle_analysis_cellprofiler_dardel, analysis: {analysis}")
+
+        analysis_id = analysis["analysis_id"]
+        sub_analysis_id = analysis["sub_id"]
+
+        # fetch the channel map for the acqusition
+        logging.debug('Running channel map query.')
+
+        channel_map = get_channel_map(cursor, analysis)
 
         # make sure channel map is populated
         if len(channel_map) == 0:
@@ -426,51 +522,8 @@ def handle_analysis_cellprofiler_dardel(analysis, cursor, connection, job_limit=
         if 'well_filter' in analysis_meta:
             well_filter = list(analysis_meta['well_filter'])
 
-
-        # fetch all images belonging to the plate acquisition
-        logging.info('Fetching images belonging to plate acqusition.')
-
-        query = ("SELECT *"
-                 " FROM images_all_view"
-                 " WHERE plate_acquisition_id=%s")
-
-        if site_filter:
-            query += f' AND site IN ({ ",".join( map( str, site_filter )) }) '
-
-        if well_filter:
-            query += ' AND well IN (' + ','.join("'{0}'".format(w) for w in well_filter) + ")"
-
-
-        query += " ORDER BY timepoint, well, site, channel"
-
-        logging.info("query: " + query)
-
-        cursor.execute(query, (analysis['plate_acquisition_id'],))
-        imgs = cursor.fetchall()
-
-        imgsets = {}
-        img_infos = {}
-        for img in imgs:
-
-            logging.debug(f'img: {img["path"]}')
-            # readability
-            imgset_id = f"{img['well']}-{img['site']}"
-
-            # if it has been seen before
-            try:
-                imgsets[imgset_id] += [img['path']]
-                img_infos[imgset_id] += [img]
-            # if it has not been seen before
-            except KeyError:
-                imgsets[imgset_id] = [img['path']]
-                img_infos[imgset_id] = [img]
-
-        # get cellprofiler-version
-        try:
-            cellprofiler_version = analysis_meta['cp_version']
-        except KeyError:
-            logging.error(f"Unable to get cellprofiler_version details from analysis entry: sub_id={sub_analysis_id}")
-            cellprofiler_version = None
+        # set images as image-sets
+        imgsets, img_infos = get_imgsets(cursor, analysis['plate_acquisition_id'], well_filter, site_filter)
 
         # check if all imgsets should be in the same job
         try:
@@ -490,20 +543,26 @@ def handle_analysis_cellprofiler_dardel(analysis, cursor, connection, job_limit=
 
         # get common output for all sub analysis
         storage_paths = get_storage_paths_from_analysis_id(cursor, analysis_id)
-        # Make sure output dir exists
-        os.makedirs(f"{storage_paths['full']}", exist_ok=True)
+        ## Make sure result dir exists
+        #os.makedirs(f"{storage_paths['full']}", exist_ok=True)
 
         # create chunks and submit as separate jobs
         random_identifier = generate_random_identifier(8)
         all_cmds = []
-        for i,imgset_chunk in enumerate(chunk_dict(img_infos, chunk_size)):
+
+        chunkesd_dict = chunk_dict(img_infos, chunk_size)
+        for i,imgset_chunk in enumerate(chunkesd_dict):
 
             # generate names
             job_number = i
             job_id = create_job_id(analysis_id, sub_analysis_id, random_identifier, job_number, n_jobs)
-            imageset_file = f"/cpp_work/input/{sub_analysis_id}/cpp-worker-job-{job_id}.csv"
+            sub_analysis_input_dir = f"/cpp_work/input/{sub_analysis_id}"
+            imageset_file = f"{sub_analysis_input_dir}/cpp-worker-job-{job_id}.csv"
             output_path = f"/cpp_work/output/{sub_analysis_id}/cpp-worker-job-{job_id}/"
             job_name = f"cpp-worker-job-{job_id}"
+
+            # create folder if needed
+            os.makedirs(sub_analysis_input_dir, exist_ok=True)
 
             logging.debug(f"job_timeout={analysis_meta.get('job_timeout')}")
 
@@ -522,79 +581,83 @@ def handle_analysis_cellprofiler_dardel(analysis, cursor, connection, job_limit=
              # generate cellprofiler imgset file for this imgset
             imageset_content = make_imgset_csv(imgsets=imgset_chunk, channel_map=channel_map, storage_paths=storage_paths, use_icf=use_icf)
 
-            # create a folder for the file if needed
-            os.makedirs(os.path.dirname(imageset_file), exist_ok=True)
             # write csv
             with open(imageset_file, 'w') as file:
+                logging.debug(f"write imgset file: {imageset_file}")
                 file.write(imageset_content)
 
             all_cmds.append(cellprofiler_cmd)
 
-            if job_limit is not None and i >= (job_limit-1):
-                print("exit here")
-                break
 
-        # when all chunks of the sub analysis are sent in, mark the sub analysis as started
-        #mark_analysis_as_started(cursor, connection, analysis['analysis_id'])
-        #mark_sub_analysis_as_started(cursor, connection, analysis['sub_id'])
-
-        sub_analysis_input_dir = f"/cpp_work/input/{sub_analysis_id}"
+        # write all cmds into a text file into input folder
         with open(f"{sub_analysis_input_dir}/cmds.txt", "w") as file:
             for item in all_cmds:
                 file.write(item + "\n")
 
+        # Write all results from dependant sub analyses into the input folder
+        result_folder = f"{storage_paths['full']}"
+        copy_dependant_results_to_input(sub_analysis_input_dir, result_folder)
+
+        # create sbatch command and exec it on server via ssh
         sub_type = analysis_meta.get('sub_type', "undefifed")
-        logging.debug("sub_type" + str(sub_type))
+        #logging.debug("sub_type" + str(sub_type))
+        cmd = build_ssh_cmd_sbatch_dardel(sub_analysis_id, sub_type)
 
-        job_id = submit_sbatch_to_dardel(sub_analysis_id, sub_type)
-
-        if job_id:
-            update_sub_analysis_status_to_db(connection, cursor, analysis_id, sub_analysis_id, f"submitted, job_id={job_id}")
-
-            # when all chunks of the sub analysis are sent in, mark the sub analysis as started
-            mark_analysis_as_started(cursor, connection, analysis['analysis_id'])
-            mark_sub_analysis_as_started(cursor, connection, analysis['sub_id'])
+        return cmd
 
 
-def submit_sbatch_to_dardel(sub_id, sub_type):
+def build_ssh_cmd_sbatch_dardel(sub_id, sub_type):
 
-    logging.info(f"inside submit_sbatch_to_dardel: {sub_id}, sub_type {sub_type}")
-
-    job_id = None
+    logging.info(f"Inside submit_sbatch_to_dardel: {sub_id}, sub_type {sub_type}")
 
     max_errors = 10
 
+    account = "naiss2023-22-1320"
+
     if sub_type == "icf":
-        nHours = 30 # it should only take about 10h, but I have noticed image load problems when running 20+ icf in parallell
-        nNodes = 1
+        partition = "shared"
+        mem = "64GB"
+        time = "15:00:00"  # it should only take about 10h, but I have noticed image load problems when running 20+ icf in parallell
+        workers = 1
+
     elif sub_type == "qc":
-        nHours = 24
-        nNodes = 16
+        partition = "main"
+        mem = "220GB"
+        time = "10:00:00"
+        workers = 100
     else:
-        nHours = 84
-        nNodes = 16
+        partition = "main"
+        mem = "220GB" # "440GB"
+        time = "01:00:00"
+        workers = 60
 
     cpp_config = load_cpp_config()
 
     # Define your command as a string
     cmd = (f"ssh -o StrictHostKeyChecking=no"
-           f" {cpp_config['uppmax_user']}@{cpp_config['uppmax_hostname']}"
+           f" {cpp_config['dardel_user']}@{cpp_config['dardel_hostname']}"
            f" sbatch"
-	       f" -M snowy"
-	       f" -n {nNodes}"
-	       f" -t {nHours}:00:00"
-	       f" --output=logs/{sub_id}-slurm.%j.out"
-           f" --error=logs/{sub_id}-slurm.%j.out"
-	       f" -A uppmax2023-2-16"
-	       f" -D /proj/uppmax2023-2-16/cpp_uppmax"
-	       f" run_cellprofiler_apptainer.sh"
-	       f" -d /cpp_work/input/{sub_id}"
-           f" -o /cpp_work/output/{sub_id}"
-           f" -w {nNodes}"
-           f" -e {max_errors}"
+           f" --partition {partition}"
+           f" --mem {mem}"
+	       f" -t {time}"
+           f" --account {account}"
+	       f" --output=logs/{sub_id}-{sub_type}-slurm.%j.out"
+           f" --error=logs/{sub_id}-{sub_type}-slurm.%j.out"
+	       f" --chdir /cfs/klemming/home/a/andlar5/cppipeline2/dardel"
+	       f" run_cellprofiler_singularity_dardel.sh"
+	       f"    -d /cpp_work/input/{sub_id}"
+           f"    -o /cpp_work/output/{sub_id}"
+           f"    -w {workers}"
+           f"    -e {max_errors}"
         )
 
-    logging.info(f"cmd: {cmd}")
+    logging.debug(f"cmd: {cmd}")
+
+    return cmd
+
+def exec_ssh_sbatch_cmd(cmd):
+
+    job_id = None
 
     try:
         # Execute the command and capture the output
@@ -616,22 +679,41 @@ def submit_sbatch_to_dardel(sub_id, sub_type):
 
     return job_id
 
-
 def get_all_dirs(path):
-    return [d.name for d in pathlib.Path(path).iterdir() if d.is_dir()]
+    # Create a Path object from the given path
+    path_obj = pathlib.Path(path)
 
-def fetch_finished_job_families_uppmax(cursor, connection, job_limit = None):
-    logging.info("Inside fetch_finished_job_families_uppmax")
+    # Check if the path exists and is a directory
+    if not path_obj.exists() or not path_obj.is_dir():
+        # Return None if the path is not a directory or does not exist
+        return None
+
+    # Initialize an empty list to hold the names of all directories
+    dir_names = []
+
+    # Iterate over each item in the directory
+    for d in path_obj.iterdir():
+        # Check if the item is a directory
+        if d.is_dir():
+            # Add the directory name to the list
+            dir_names.append(d.name)
+
+    # Return the list of directory names
+    return dir_names
+
+
+def fetch_finished_job_families_dardel(cursor, connection):
+    logging.info("Inside fetch_finished_job_families_dardel")
 
     sql = (f"""
             SELECT *
             FROM image_sub_analyses
             WHERE finish IS null
             AND error IS null
-            AND meta->>'run_on_uppmax' IS NOT null
+            AND meta->>'run_on_dardel' IS NOT null
             """)
 
-    logging.debug("sql" + sql)
+    logging.debug("sql: " + sql)
 
     cursor.execute(sql)
 
@@ -641,20 +723,20 @@ def fetch_finished_job_families_uppmax(cursor, connection, job_limit = None):
     for sub_analysis in unfinished_sub_analyses:
         sub_id = sub_analysis['sub_id']
         analysis_id = sub_analysis['analysis_id']
-        # logging.info(f"sub_analyses: {sub_id}")
+        # logging.debug(f"sub_analyses: {sub_id}")
 
         sub_analysis_out_path = f"/cpp_work/output/{sub_id}"
-        #logging.info(f'sub_analysis_out_path {sub_analysis_out_path}')
+        #logging.debug(f'sub_analysis_out_path {sub_analysis_out_path}')
 
         # list all jobs in output
         if os.path.exists(sub_analysis_out_path):
             all_sub_analyses_jobs = get_all_dirs(sub_analysis_out_path)
-            logging.info(f'len(all_sub_analyses_jobs) {len(all_sub_analyses_jobs)}')
+            logging.debug(f'len(all_sub_analyses_jobs) {len(all_sub_analyses_jobs)}')
             for job in all_sub_analyses_jobs:
 
                 job_path = os.path.join(sub_analysis_out_path, job)
 
-                #logging.info(f'job_path {job_path}')
+                #logging.indebugfo(f'job_path {job_path}')
 
                 if os.path.exists(os.path.join(job_path, "error")):
                     # skip this one
@@ -663,7 +745,7 @@ def fetch_finished_job_families_uppmax(cursor, connection, job_limit = None):
                     finished_jobs[job] = {"metadata": {"name": job, "sub_id": sub_id, "analysis_id": analysis_id}}
                     logging.debug(f"Job finished: {job}")
 
-            logging.info(f"Finished jobs after this sub {str(len(finished_jobs))}")
+            logging.debug(f"Finished jobs after this sub {str(len(finished_jobs))}")
 
 
     logging.info("Finished jobs done " + str(len(finished_jobs)))
@@ -695,7 +777,7 @@ def fetch_finished_job_families_uppmax(cursor, connection, job_limit = None):
         logging.info(f"fam-job-count: {family_job_count}\tfinished-job-list-len: {len(job_list)}")
         # check if there are as many finished jobs as the total job count for the family
         # for debug reasons we also check if the job limit is reached
-        if family_job_count == len(job_list) or (job_limit is not None and len(job_list) == job_limit):
+        if family_job_count == len(job_list):
 
             # then all jobs in this family are finished and ready to be processed
             finished_families[family_name] = job_list
@@ -777,17 +859,15 @@ def to32bit(t):
 
 # goes through all jobs of a family i.e. merges the csvs with the same names into
 # a single resulting csv file for the entire family, e.g. ..._Experiment.csv, ..._Image.csv
-def merge_family_jobs_csv_to_parquet(family_name, cursor, connection):
+
+def merge_family_jobs_csv_to_parquet(analysis: Analysis, db: Database):
 
     logging.info("Inside merge_family_jobs_csv_to_parquet")
 
     # find all csv files in the sub-analayses folder
-    analysis_sub_id = get_analysis_sub_id_from_family_name(family_name)
-    sub_analysis_path = f"/cpp_work/output/{analysis_sub_id}/"
-
     # Put csv-files in dict of lists where dict-key is csv-filename (all files have same name
     # but are in different sub-dirs (job-dirs))
-    all_csv_files = pathlib.Path(sub_analysis_path).rglob("*.csv")
+    all_csv_files = pathlib.Path(analysis.analysis_path).rglob("*.csv")
     filename_dict = {}
     for file in all_csv_files:
         filename = os.path.basename(file)
@@ -830,19 +910,19 @@ def merge_family_jobs_csv_to_parquet(family_name, cursor, connection):
                         logging.info(f'{n}/{len(files)} {filename}')
                     n = n+1
 
-            logging.info(f'done concat csv {filename}')
-            logging.info(f"elapsed: {(time.time() - start):.3f}")
-            logging.info(f'start pd.read_csv {tmp_csvfile}')
+            logging.debug(f'done concat csv {filename}')
+            logging.debug(f"elapsed: {(time.time() - start):.3f}")
             pyarrow.set_cpu_count(5)
-            #parse_options
+            logging.debug(f'start pd.read_csv {tmp_csvfile}')
             df = pd.read_csv(tmp_csvfile, engine='pyarrow')
+            logging.debug(f'done pd.read_csv {tmp_csvfile}')
             os.remove(tmp_csvfile)
             logging.info(f'done concat {filename}')
             logging.info(f"elapsed: {(time.time() - start):.3f}")
             logging.info(f'start save as parquet {filename}')
             df = to32bit(df)
             parquetfilename = os.path.splitext(filename)[0] + '.parquet'
-            parquetfile = os.path.join(sub_analysis_path, parquetfilename)
+            parquetfile = os.path.join(analysis.analysis_path, parquetfilename)
             df.to_parquet(parquetfile)
             logging.info(f'done save as parquet {parquetfile}')
             logging.info(f"elapsed: {(time.time() - start):.3f}")
@@ -850,11 +930,11 @@ def merge_family_jobs_csv_to_parquet(family_name, cursor, connection):
         except Exception as e:
             errormessage = f"Failed during concat csv files, error {e}"
             logging.error(errormessage)
-            analysis_id = get_analysis_sub_id_from_family_name(family_name)
-            set_sub_analysis_error(cursor, connection, analysis_id, analysis_sub_id, errormessage)
+            db.set_sub_analysis_error(analysis, errormessage)
+
 
             # delete all jobs for this sub_analysis
-            delete_jobs(analysis_sub_id)
+            delete_jobs(analysis.analysis_id)
 
         finally:
             if os.path.exists(tmp_csvfile):
@@ -866,11 +946,74 @@ def merge_family_jobs_csv_to_parquet(family_name, cursor, connection):
 def delete_jobs(analysis_sub_id):
     logging.info("TODO jsub analysis running jobs should be deleted here")
 
+def copy_results_to_input(to_dir, from_dir):
+    logging.info("Inside copy_results_to_input")
+    # List of file suffixes to skip, in lower case for case-insensitive comparison
+    skip_suffixes = ['.csv', '.log', '.png', '.tif', '.tiff', 'finished']
+
+    # Check if the source (input) directory exists
+    if not os.path.exists(from_dir):
+        logging.debug(f"The source directory {from_dir} does not exist.")
+        return  # Exit the function
+
+    # Ensure the target (output) directory exists; if not, create it.
+    if not os.path.exists(to_dir):
+        os.makedirs(to_dir)
+        logging.debug(f"The target directory {to_dir} was created.")
+
+    # List all the files and directories in the source directory.
+    for item in os.listdir(from_dir):
+        source = os.path.join(from_dir, item)
+        destination = os.path.join(to_dir, item)
+
+        # Check if the current item is a file and not in the skip list.
+        if os.path.isfile(source) and not any(source.lower().endswith(suffix) for suffix in skip_suffixes):
+            # Copy the file to the destination directory.
+            shutil.copy2(source, destination)  # copy2 preserves metadata
+            logging.debug(f"File {source} copied to {destination}")
+        elif os.path.isfile(source):
+            # Log skipping of the file
+            logging.debug(f"File {source} skipped due to suffix.")
+
+
+
+def copy_dependant_results_to_input(to_dir, from_dir):
+    logging.info(f"copy_dependant_results_to_input, to_dir {to_dir} from_dir{from_dir}")
+    # List of file suffixes to include, in lower case for case-insensitive comparison
+    include_suffixes = ['.npy']
+
+    # Check if the source (input) directory exists
+    if not os.path.exists(from_dir):
+        logging.debug(f"The source directory {from_dir} does not exist. return")
+        return  # Exit the function
+
+    # Check if target exist
+    if not os.path.exists(to_dir):
+        logging.debug(f"The target directory {to_dir} does not exist. return")
+        return
+
+    # List all the files and directories in the source directory.
+    for item in os.listdir(from_dir):
+        source = os.path.join(from_dir, item)
+        destination = os.path.join(to_dir, item)
+
+        # Check if the current item is a file and if it ends with one of the included suffixes.
+        if os.path.isfile(source) and any(source.lower().endswith(suffix) for suffix in include_suffixes):
+            # Copy the file to the destination directory.
+            shutil.copy2(source, destination)  # copy2 preserves metadata
+            logging.debug(f"File {source} copied to {destination}")
+        elif os.path.isfile(source):
+            # Log skipping of the file
+            logging.debug(f"File {source} skipped due to not matching include suffixes.")
+
 
 # goes through all the non-csv filescsv of a family of job and copies the result to the result folder
 def move_job_results_to_storage(family_name, job_list, storage_root):
 
-    logging.info("inside move_job_results_to_storage")
+    logging.info("Inside move_job_results_to_storage")
+
+    skip_suffixes = ['.csv', '.log']
+    skip_files = ['finished']
 
     files_created = []
 
@@ -882,11 +1025,11 @@ def move_job_results_to_storage(family_name, job_list, storage_root):
         job_path = f"/cpp_work/output/{analysis_sub_id}/{job['metadata']['name']}"
         for result_file in pathlib.Path(job_path).rglob("*"):
 
-            logging.debug("copy file: " + str(result_file))
+            logging.debug("move file: " + str(result_file))
 
             # exclude files with these extensions
-            if result_file.suffix in ['.csv', '.log'] or pathlib.Path.is_dir(result_file):
-                logging.debug("continue")
+            if result_file.suffix in skip_suffixes or result_file.name in skip_files or pathlib.Path.is_dir(result_file):
+                logging.debug("Skipping file: " + str(result_file))
                 continue
 
             # keep only the path relative to the job_path
@@ -902,7 +1045,7 @@ def move_job_results_to_storage(family_name, job_list, storage_root):
             # remember the file
             files_created.append(f"{filename}")
 
-            logging.debug("done copy file: " + str(filename))
+            logging.debug("done move file: " + str(filename))
 
     # move the concatenated output-csv that are in parquet format in sub-analysis dir
     sub_analysis_path = f"/cpp_work/output/{analysis_sub_id}/"
@@ -920,7 +1063,7 @@ def move_job_results_to_storage(family_name, job_list, storage_root):
         logging.debug("done copy file: " + str(filename))
 
 
-    logging.info("done move_job_results_to_storage")
+    logging.info("Done move_job_results_to_storage")
 
     return files_created
 
@@ -948,7 +1091,7 @@ def get_analysis_id_from_family_name(family_name):
     match = re.match('cpp-worker-job-\d+-\w+-\d+-\d+-(\d+)', family_name)
     return int(match.groups()[0])
 
-def get_analysis_info(cursor, analysis_id):
+def get_analysis_from_db(cursor, analysis_id):
 
     # fetch all images belonging to the plate acquisition
     logging.info('Fetching plate info from view.')
@@ -958,57 +1101,53 @@ def get_analysis_info(cursor, analysis_id):
                         WHERE id='{analysis_id}'
                        """ # also NOT IN (select * from images_analysis where analysed=None) or something
 
-    logging.info(query)
+    logging.debug(query)
     cursor.execute(query)
-    plate_info = cursor.fetchone()
+    analysis = cursor.fetchone()
 
-    return plate_info
+    return analysis
 
-def get_sub_analysis_info(cursor, analysis_sub_id):
+def get_sub_analysis_from_db(cursor, analysis_sub_id):
 
     # fetch all images belonging to the plate acquisition
-    logging.info('Fetching plate info from view1')
+    logging.debug('Fetching plate info from view1')
     query = f"""
                         SELECT *
                         FROM image_sub_analyses_v1
                         WHERE sub_id=%s
-                       """ # also NOT IN (select * from images_analysis where analysed=None) or something
+            """            # also NOT IN (select * from images_analysis where analysed=None) or something
 
-    logging.info(query)
+    mogrified_query = cursor.mogrify(query)
 
-    cpp_config = load_cpp_config()
-    connection, cursor2 = connect_db(cpp_config)
+    # Convert byte string to a normal string and log it
+    logging.debug(mogrified_query.decode('utf-8'))
 
-    cursor2.execute(query, (analysis_sub_id,))
-    plate_info = cursor2.fetchone()
-    cursor2.close()
-    connection.close()
+    cursor.execute(query, (analysis_sub_id,))
+    sub_analysis = cursor.fetchone()
 
-    logging.info("plate_info:" + str(plate_info))
+    if sub_analysis is None:
+        logging.error("sub_analysis is None, sub_id not found, should not be able to happen....")
 
-    if plate_info is None:
-        logging.error("plate_info is None, sub_id not found, should not be able to happen....")
-
-    return plate_info
+    return sub_analysis
 
 def update_sub_analysis_errormsg_to_db(connection, cursor, analysis_id, sub_analysis_id, errormessage):
     # TODO first get current errormessage, then append id
-    update_meta_data_to_db(connection, cursor, analysis_id, sub_analysis_id, "error", errormessage)
+    update_progress_data_to_db(connection, cursor, analysis_id, sub_analysis_id, "error", errormessage)
 
 def update_sub_analysis_status_to_db(connection, cursor, analysis_id, sub_analysis_id, status):
-    update_meta_data_to_db(connection, cursor, analysis_id, sub_analysis_id, "status", status)
+    update_progress_data_to_db(connection, cursor, analysis_id, sub_analysis_id, "status", status)
 
 def update_sub_analysis_progress_to_db(connection, cursor, analysis_id, sub_analysis_id, progress):
-    update_meta_data_to_db(connection, cursor, analysis_id, sub_analysis_id, "progress", progress)
+    update_progress_data_to_db(connection, cursor, analysis_id, sub_analysis_id, "progress", progress)
 
-def update_meta_data_to_db(connection, cursor, analysis_id, sub_analysis_id, data_key, data_value):
-    logging.debug(f"inside update_meta_data_to_db for {data_key}")
+def update_progress_data_to_db(connection, cursor, analysis_id, sub_analysis_id, data_key, data_value):
+    logging.info(f"inside update_progress_data_to_db for {data_key}")
 
     data = f'{{"{data_key}": "{data_value}"}}'
 
     # update image_sub_analyses
     query = """UPDATE image_sub_analyses
-               SET meta = meta || %s
+               SET progress = progress || %s
                WHERE sub_id=%s
             """
 
@@ -1018,7 +1157,7 @@ def update_meta_data_to_db(connection, cursor, analysis_id, sub_analysis_id, dat
 
     # update image_analyses
     query = """UPDATE image_analyses
-               SET meta = meta || %s
+               SET progress = progress || %s
                WHERE id=%s
             """
 
@@ -1104,6 +1243,8 @@ def filter_list_remove_files_suffix(input_list, suffix):
 
 # go through unfinished analyses and wrap them up if possible (check if sub-analyses belonging to them are all finished)
 def handle_finished_analyses(cursor, connection):
+
+    logging.info("Inside handle_finished_analyses")
 
     # fetch all unfinished analyses
     cursor.execute(f"""
@@ -1220,7 +1361,7 @@ def handle_sub_analysis_error(cursor, connection, job):
     sub_anal_err_count[str(sub_analysis_id)] = sub_anal_err_count.get(str(sub_analysis_id), 0) + 1
 
     error_count = sub_anal_err_count[str(sub_analysis_id)]
-    logging.info("error_count: " + str(error_count))
+    logging.debug("error_count: " + str(error_count))
 
     # get max_errors for this sub-analysis
     max_errors = get_sub_analysis_max_errors(cursor, connection, sub_analysis_id)
@@ -1319,8 +1460,6 @@ def mark_analysis_as_started(cursor, connection, analysis_id):
     connection.commit()
 
 
-
-
 def mark_sub_analysis_as_started(cursor, connection, sub_analysis_id):
 
     query = """ UPDATE image_sub_analyses
@@ -1334,7 +1473,7 @@ def mark_sub_analysis_as_started(cursor, connection, sub_analysis_id):
 
 def get_storage_paths_from_analysis_id(cursor, analysis_id):
 
-    analysis_info = get_analysis_info(cursor, analysis_id)
+    analysis_info = get_analysis_from_db(cursor, analysis_id)
 
     plate_barcode = analysis_info["plate_barcode"]
     acquisition_id = analysis_info["plate_acquisition_id"]
@@ -1343,9 +1482,9 @@ def get_storage_paths_from_analysis_id(cursor, analysis_id):
 
 def get_storage_paths_from_sub_analysis_id(cursor, sub_analysis_id):
 
-    logging.info("Inside get_storage_paths_from_sub_analysis_id")
+    logging.debug("Inside get_storage_paths_from_sub_analysis_id")
 
-    analysis_info = get_sub_analysis_info(cursor, sub_analysis_id)
+    analysis_info = get_sub_analysis_from_db(cursor, sub_analysis_id)
 
     plate_barcode = analysis_info["plate_barcode"]
     acquisition_id = analysis_info["plate_acquisition_id"]
@@ -1361,22 +1500,19 @@ def get_storage_paths(plate_barcode, acquisition_id, analysis_id):
         }
     return storage_paths
 
-def main():
-
-    try:
-
+def setup_logging(log_level):
         # set up logging to file
         now = datetime.datetime.now()
         now_string = now.strftime("%Y-%m-%d_%H.%M.%S.%f")
 
-        print (f"is_debug {is_debug()}")
+        print(f"is_debug {is_debug()}")
 
-        log_prefix = ""
-        if is_debug():
+        if log_level == logging.DEBUG:
             log_prefix = "debug."
+        else:
+            log_prefix = ""
 
         logfile_name = "/cpp_work/logs/cpp_master_v2." + log_prefix + now_string + ".log"
-        log_level = logging.DEBUG if is_debug() else logging.INFO
 
         logging.basicConfig(format='%(asctime)s,%(msecs)d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
                             datefmt='%Y-%m-%d:%H:%M:%S',
@@ -1397,7 +1533,28 @@ def main():
         # add the handler to the root logger
         logging.getLogger('').addHandler(console)
 
+def init_new_db(cpp_config):
+     # Initialize the connection pool
+     Database.get_instance().initialize_connection_pool(
+                    dbname=cpp_config['postgres']['db'],
+                    user=cpp_config['postgres']['user'],
+                    host=cpp_config['postgres']['host'],
+                    port=cpp_config['postgres']['port'],
+                    password=cpp_config['postgres']['password']
+        )
+
+def main():
+
+    try:
+
+        log_level = logging.DEBUG if is_debug() else logging.INFO
+        setup_logging(log_level)
+
         logging.info("isdebug:" + str(is_debug()))
+
+        cpp_config = load_cpp_config()
+
+        init_new_db(cpp_config)
 
         # set file permissions on ssh key
         #os.chmod('/root/.ssh/id_rsa', 0o600)
@@ -1411,29 +1568,25 @@ def main():
 
             try:
 
-                if is_debug():
-                    job_limit = None
-                else:
-                    job_limit = None
-
                 # init connections
-                cpp_config = load_cpp_config()
                 connection, cursor = connect_db(cpp_config)
 
-                handle_new_jobs(cursor, connection, job_limit = job_limit)
+                handle_new_analyses(cursor, connection)
 
-                finished_families = fetch_finished_job_families_uppmax(cursor, connection, job_limit = job_limit)
+                finished_families = fetch_finished_job_families_dardel(cursor, connection)
 
                 # merge finised jobs for each family (i.e. merge jobs for a sub analysis)
                 for family_name, job_list in finished_families.items():
 
                     sub_analysis_id = get_analysis_sub_id_from_family_name(family_name)
+                    analysis_id = get_analysis_id_from_family_name(family_name)
 
                     # final results should be stored in an analysis id based folder e.g. all sub ids beling to the same analyiss id sould be stored in the same folder
                     storage_paths = get_storage_paths_from_sub_analysis_id(cursor, sub_analysis_id)
 
                     # merge all job csvs into family csv
-                    files_created = merge_family_jobs_csv_to_parquet(family_name, cursor, connection)
+                    analysis = Database.get_instance().get_analysis_from_sub_id(sub_analysis_id)
+                    files_created = merge_family_jobs_csv_to_parquet(analysis, Database.get_instance())
 
                     # move all files to storage, e.g. results folder
                     files_created = move_job_results_to_storage(family_name, job_list, storage_paths)
@@ -1471,11 +1624,4 @@ def main():
 
 if __name__ == "__main__":
 
-
     main()
-
-
-
-
-
-

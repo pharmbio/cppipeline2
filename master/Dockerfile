@@ -8,7 +8,8 @@ RUN apt update && \
 RUN pip3 install psycopg2-binary \
                  kubernetes \
                  pandas==1.5 \
-                 pyarrow==10
+                 pyarrow==10 \
+                 python-dotenv
 
 
 # set timezone

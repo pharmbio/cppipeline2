@@ -82,7 +82,7 @@ def stage_images(image_list):
     logging.info(f"done stage_images")
 
 def stage_files_with_scp(pathname_list, target_directory, remote_ssh_host_config):
-    logging.info(f"inside stage_files_with_scp target_dir {target_directory} pathname_list {pathname_list}")
+    logging.info(f"inside stage_files_with_scp, target {target_directory} len(pathname_list) {len(pathname_list)}")
     if not os.path.exists(target_directory):
         os.makedirs(target_directory, exist_ok=True)
 
@@ -92,7 +92,7 @@ def stage_files_with_scp(pathname_list, target_directory, remote_ssh_host_config
 
         # Ensure the subdirectory structure for the local path exists
         local_subdir = os.path.dirname(local_path)
-        logging.info(f"local_subdir {local_subdir}")
+        #logging.debug(f"local_subdir {local_subdir}")
         if not os.path.exists(local_subdir):
             os.makedirs(local_subdir)
 
@@ -108,9 +108,11 @@ def stage_files_with_scp(pathname_list, target_directory, remote_ssh_host_config
         else:
             logging.debug(f"File '{local_path}' already exists in '{target_directory}'.")
 
+    logging.info("Done stage_files_with_scp")
+
 
 def set_permissions_recursive(path, permissions=0o777):
-    logging.info(f"inside set_permissions_recursive {path}")
+    logging.info(f"Inside set_permissions_recursive {path}")
 
     #set permissions for the input directory itself
     os.chmod(path, permissions)
@@ -120,7 +122,7 @@ def set_permissions_recursive(path, permissions=0o777):
             os.chmod(os.path.join(dirpath, dirname), permissions)
         for filename in filenames:
             os.chmod(os.path.join(dirpath, filename), permissions)
-    logging.info(f"done set_permissions_recursive {path}")
+    logging.info(f"Done set_permissions_recursive {path}")
 
 
 def run_cmd(cmd):
@@ -137,7 +139,7 @@ def run_cmd(cmd):
     output_dir = None
     try:
         if cmd is None or cmd.isspace():
-            logging.info(f"return becatce cmd is None or cmd.isspace()")
+            logging.debug(f"return becatce cmd is None or cmd.isspace()")
             return
 
         # get parameters from cmd
@@ -160,7 +162,7 @@ def run_cmd(cmd):
 
         # check if finished file exists, then skip this command
         if os.path.exists(os.path.join(output_dir, "finished")):
-            logging.info(f"finished file exist, skip this job")
+            logging.debug(f"finished file exist, skip this job")
         else:
             # Ensure output directory exists
             os.makedirs(output_dir, exist_ok=True)
