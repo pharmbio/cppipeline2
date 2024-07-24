@@ -148,7 +148,7 @@ class Database:
                 self.release_connection(conn)
         return analysis
 
-    def set_sub_analysis_error(annalysis: Analysis, errormessage: str):
+    def set_sub_analysis_error(self, annalysis: Analysis, errormessage: str):
         logging.error(f"TODO implement set sub analysis error, errormessage: {errormessage}")
 
     def update_progress_meta(self, analysis_id, sub_analysis_id, data_key, data_value):

@@ -103,8 +103,8 @@ def check_analyses_finished(analyses):
 
 
 # function for making a cellprofiler formatted csv file
-def make_imgset_csv(imgsets, channel_map, storage_paths, use_icf):
-    logging.info("Inside make_imgset_csv")
+def make_imgset_csv(imgsets, channel_map, sub_analysis_input_dir, use_icf):
+    #logging.debug("Inside make_imgset_csv")
 
     ### create header row
     header = ""
@@ -177,7 +177,7 @@ def make_imgset_csv(imgsets, channel_map, storage_paths, use_icf):
         # all images with same channel have the same correction image
         if use_icf:
 
-            icf_path = storage_paths['full']
+            icf_path = sub_analysis_input_dir # icf numpy arrays will be in the input directory
 
             # First as URL
             for ch_nr,ch_name in sorted(channel_map.items()):
@@ -339,11 +339,11 @@ def load_cpp_config():
 
     cpp_config['postgres']['password'] = os.environ.get('DB_PASS')
 
-    # fetch config
-    cpp_config['dardel_user'] = cpp_config['dardel']['user']
-    cpp_config['dardel_hostname'] = cpp_config['dardel']['hostname']
-    cpp_config['uppmax_user'] = cpp_config['uppmax']['user']
-    cpp_config['uppmax_hostname'] = cpp_config['uppmax']['hostname']
+    # # fetch config
+    # cpp_config['dardel_user'] = cpp_config['dardel']['user']
+    # cpp_config['dardel_hostname'] = cpp_config['dardel']['hostname']
+    # cpp_config['uppmax_user'] = cpp_config['uppmax']['user']
+    # cpp_config['uppmax_hostname'] = cpp_config['uppmax']['hostname']
 
 
     return cpp_config
@@ -424,6 +424,28 @@ def get_channel_map(cursor, analysis):
 
     return channel_map
 
+def get_first_z_plane(cursor, acq_id):
+    # Log the start of fetching data
+    logging.info(f'Fetching minimum z-plane for plate acquisition ID: {acq_id}')
+
+    # SQL query to select the minimum z value where the plate_acquisition_id matches
+    query = """
+            SELECT min(z) AS min_z
+            FROM images
+            WHERE plate_acquisition_id = %s
+            """
+    # Log the query string
+    logging.info('Executing query: %s with ID: %s', query.strip(), acq_id)
+
+    # Execute the SQL query with the provided acquisition ID
+    cursor.execute(query, (acq_id,))
+
+    # Fetch the result as a dictionary
+    result = cursor.fetchone()
+
+    return result['min_z']
+
+
 def get_imgsets(cursor, acq_id, well_filter=None, site_filter=None):
         # fetch all images belonging to the plate acquisition
         logging.info('Fetching images belonging to plate acqusition.')
@@ -471,7 +493,7 @@ def handle_analysis_cellprofiler_dardel(analysis, cursor, connection):
         sub_analysis_id = analysis["sub_id"]
         sub_analysis_input_dir = f"/cpp_work/input/{sub_analysis_id}"
 
-        cmd = prepare_analysis_cellprofiler_dardel(analysis, cursor)
+        cmd = prepare_analysis_cellprofiler_dardel(analysis, cursor, connection)
 
         # write sbatch file to input dir (for debug and re-submit functionality)
         sbatch_out_file = f"{sub_analysis_input_dir}/sbatch.sh"
@@ -490,21 +512,13 @@ def handle_analysis_cellprofiler_dardel(analysis, cursor, connection):
             mark_sub_analysis_as_started(cursor, connection, analysis['sub_id'])
 
 
-def prepare_analysis_cellprofiler_dardel(analysis, cursor, ):
+def prepare_analysis_cellprofiler_dardel(analysis, cursor, connection ):
 
         logging.info(f"Inside handle_analysis_cellprofiler_dardel, analysis: {analysis}")
 
         analysis_id = analysis["analysis_id"]
         sub_analysis_id = analysis["sub_id"]
 
-        # fetch the channel map for the acqusition
-        logging.debug('Running channel map query.')
-
-        channel_map = get_channel_map(cursor, analysis)
-
-        # make sure channel map is populated
-        if len(channel_map) == 0:
-            raise ValueError('Channel map is empty, possible error in plate acqusition id.')
 
         # get analysis settings
         try:
@@ -522,8 +536,92 @@ def prepare_analysis_cellprofiler_dardel(analysis, cursor, ):
         if 'well_filter' in analysis_meta:
             well_filter = list(analysis_meta['well_filter'])
 
-        # set images as image-sets
-        imgsets, img_infos = get_imgsets(cursor, analysis['plate_acquisition_id'], well_filter, site_filter)
+        channels_filter = None
+        if 'channels' in analysis_meta:
+            channels_filter = list(analysis_meta['channels'])
+
+        # to do fix this
+        if 'z' in analysis_meta:
+            z = analysis_meta['z']
+        else:
+            z = get_first_z_plane(cursor, analysis['plate_acquisition_id'])
+
+
+        # fetch all images belonging to the plate acquisition
+        logging.info('Fetching images belonging to plate acqusition.')
+
+        query = ("SELECT *"
+                 " FROM images_all_view"
+                 " WHERE plate_acquisition_id=%s"
+                 " AND z = %s")
+
+        if site_filter:
+            query += f' AND site IN ({ ",".join( map( str, site_filter )) }) '
+
+        if well_filter:
+            query += ' AND well IN (' + ','.join("'{0}'".format(well) for well in well_filter) + ")"
+
+        if channels_filter:
+            query += ' AND dye IN (' + ','.join("'{0}'".format(chan) for chan in channels_filter) + ")"
+
+        query += " ORDER BY timepoint, well, site, channel"
+
+        logging.info("query: " + query)
+
+        cursor.execute(query, (analysis['plate_acquisition_id'], z, ))
+        imgs = cursor.fetchall()
+
+        # make imgsets of result
+        imgsets = {}
+        img_infos = {}
+        for img in imgs:
+
+            # readability
+            imgset_id = f"{img['well']}-{img['site']}"
+
+            # if it has been seen before
+            try:
+                imgsets[imgset_id] += [img['path']]
+                img_infos[imgset_id] += [img]
+            # if it has not been seen before
+            except KeyError:
+                imgsets[imgset_id] = [img['path']]
+                img_infos[imgset_id] = [img]
+
+        # fetch the channel map for the acqusition
+        logging.info('Running channel map query.')
+        cursor.execute(f'''
+                            SELECT *
+                            FROM channel_map
+                            WHERE map_id=(SELECT channel_map_id
+                                          FROM plate_acquisition
+                                          WHERE id={analysis['plate_acquisition_id']})
+                           ''')
+        channel_map_res = cursor.fetchall()
+        # make sure channel map is populated
+
+        channel_map = {}
+        # Check if the analysis_meta channels list is provided; if not, include all results without filtering
+        if channels_filter is None:
+            # Include all channels from the results without filtering
+            for channel in channel_map_res:
+                channel_map[channel['channel']] = channel['dye']
+        else:
+            # Filter the results to include only those where the dye is in the 'channels' list
+            for channel in channel_map_res:
+                if channel['dye'] in channels_filter:
+                    channel_map[channel['channel']] = channel['dye']
+
+        if len(channel_map) == 0:
+            set_sub_analysis_error(cursor, connection, analysis_id, sub_analysis_id, 'Channel map is empty')
+            raise ValueError('Channel map is empty, possible error in plate acqusition id.')
+
+        # get cellprofiler-version
+        try:
+            cellprofiler_version = analysis_meta['cp_version']
+        except KeyError:
+            logging.error(f"Unable to get cellprofiler_version details from analysis entry: sub_id={sub_analysis_id}")
+            cellprofiler_version = None
 
         # check if all imgsets should be in the same job
         try:
@@ -536,27 +634,26 @@ def prepare_analysis_cellprofiler_dardel(analysis, cursor, ):
             # put them all in the same job if chunk size is less or equal to zero
             chunk_size = max(1, len(imgsets))
 
+
         # calculate the number of chunks that will be created
         n_imgsets = len(imgsets)
         n_jobs_unrounded = n_imgsets / chunk_size
         n_jobs = math.ceil(n_jobs_unrounded)
 
-        # get common output for all sub analysis
+        # get common output for all sub analysis (result dir)
         storage_paths = get_storage_paths_from_analysis_id(cursor, analysis_id)
-        ## Make sure result dir exists
-        #os.makedirs(f"{storage_paths['full']}", exist_ok=True)
+        sub_analysis_input_dir = f"/cpp_work/input/{sub_analysis_id}"
 
         # create chunks and submit as separate jobs
         random_identifier = generate_random_identifier(8)
         all_cmds = []
-
         chunkesd_dict = chunk_dict(img_infos, chunk_size)
+        logging.info("creating jobs")
         for i,imgset_chunk in enumerate(chunkesd_dict):
 
             # generate names
             job_number = i
             job_id = create_job_id(analysis_id, sub_analysis_id, random_identifier, job_number, n_jobs)
-            sub_analysis_input_dir = f"/cpp_work/input/{sub_analysis_id}"
             imageset_file = f"{sub_analysis_input_dir}/cpp-worker-job-{job_id}.csv"
             output_path = f"/cpp_work/output/{sub_analysis_id}/cpp-worker-job-{job_id}/"
             job_name = f"cpp-worker-job-{job_id}"
@@ -564,7 +661,7 @@ def prepare_analysis_cellprofiler_dardel(analysis, cursor, ):
             # create folder if needed
             os.makedirs(sub_analysis_input_dir, exist_ok=True)
 
-            logging.debug(f"job_timeout={analysis_meta.get('job_timeout')}")
+            #logging.debug(f"job_timeout={analysis_meta.get('job_timeout')}")
 
             job_timeout = analysis_meta.get('job_timeout', "10800")
             priority = analysis_meta.get('priority', 0)
@@ -577,22 +674,31 @@ def prepare_analysis_cellprofiler_dardel(analysis, cursor, ):
 
             # Check if icf headers should be added to imgset csv file, default is False
             use_icf = analysis_meta.get('use_icf', False)
-            logging.debug("use_icf" + str(use_icf))
              # generate cellprofiler imgset file for this imgset
-            imageset_content = make_imgset_csv(imgsets=imgset_chunk, channel_map=channel_map, storage_paths=storage_paths, use_icf=use_icf)
+            imageset_content = make_imgset_csv(imgsets=imgset_chunk, channel_map=channel_map,
+                                               sub_analysis_input_dir=sub_analysis_input_dir, use_icf=use_icf)
 
+            # create a folder for the file if needed
+            os.makedirs(os.path.dirname(imageset_file), exist_ok=True)
             # write csv
             with open(imageset_file, 'w') as file:
-                logging.debug(f"write imgset file: {imageset_file}")
                 file.write(imageset_content)
 
             all_cmds.append(cellprofiler_cmd)
 
 
+        logging.info("done creating jobs")
+
         # write all cmds into a text file into input folder
         with open(f"{sub_analysis_input_dir}/cmds.txt", "w") as file:
             for item in all_cmds:
                 file.write(item + "\n")
+
+        # write a stage list
+        with open(f"{sub_analysis_input_dir}/stage_images.txt", "w") as file:
+            for imgset in imgsets.values():
+                for path in imgset:
+                    file.write(path + "\n")
 
         # Write all results from dependant sub analyses into the input folder
         result_folder = f"{storage_paths['full']}"
@@ -601,58 +707,49 @@ def prepare_analysis_cellprofiler_dardel(analysis, cursor, ):
         # create sbatch command and exec it on server via ssh
         sub_type = analysis_meta.get('sub_type', "undefifed")
         #logging.debug("sub_type" + str(sub_type))
-        cmd = build_ssh_cmd_sbatch_dardel(sub_analysis_id, sub_type)
+        cmd = build_ssh_cmd_sbatch_dardel(analysis_id, sub_analysis_id, sub_type)
 
         return cmd
 
 
-def build_ssh_cmd_sbatch_dardel(sub_id, sub_type):
+def build_ssh_cmd_sbatch_dardel(analysis_id, sub_id, sub_type):
 
     logging.info(f"Inside submit_sbatch_to_dardel: {sub_id}, sub_type {sub_type}")
 
+    cpp_config = load_cpp_config()
+    dardel_config = cpp_config['cluster']['dardel']
+    resources = dardel_config['resources']
+    user = dardel_config['user']
+    hostname = dardel_config['hostname']
+    account = dardel_config['account']
     max_errors = 10
 
-    account = "naiss2023-22-1320"
+    # Resource subtype configuration based on sub_type
+    resource_subtype = resources.get(sub_type, resources['default'])
+    partition = resource_subtype['partition']
+    nTasks = resource_subtype.get('nTasks')
+    mem = resource_subtype['mem']
+    time = resource_subtype['time']
+    workers = resource_subtype['workers']
 
-    if sub_type == "icf":
-        partition = "shared"
-        mem = "64GB"
-        time = "15:00:00"  # it should only take about 10h, but I have noticed image load problems when running 20+ icf in parallell
-        workers = 1
-
-    elif sub_type == "qc":
-        partition = "main"
-        mem = "220GB"
-        time = "10:00:00"
-        workers = 100
-    else:
-        partition = "main"
-        mem = "220GB" # "440GB"
-        time = "01:00:00"
-        workers = 60
-
-    cpp_config = load_cpp_config()
-
-    # Define your command as a string
-    cmd = (f"ssh -o StrictHostKeyChecking=no"
-           f" {cpp_config['dardel_user']}@{cpp_config['dardel_hostname']}"
-           f" sbatch"
+    # Command construction using f-string
+    cmd = (f"ssh -o StrictHostKeyChecking=no {user}@{hostname} sbatch"
            f" --partition {partition}"
            f" --mem {mem}"
-	       f" -t {time}"
+           f"{f' -n {nTasks}' if nTasks is not None else ''}"
+           f" -t {time}"
            f" --account {account}"
-	       f" --output=logs/{sub_id}-{sub_type}-slurm.%j.out"
+           f" --job-name=cpp_{analysis_id}_{sub_id}_{sub_type}"
+           f" --output=logs/{sub_id}-{sub_type}-slurm.%j.out"
            f" --error=logs/{sub_id}-{sub_type}-slurm.%j.out"
-	       f" --chdir /cfs/klemming/home/a/andlar5/cppipeline2/dardel"
-	       f" run_cellprofiler_singularity_dardel.sh"
-	       f"    -d /cpp_work/input/{sub_id}"
-           f"    -o /cpp_work/output/{sub_id}"
-           f"    -w {workers}"
-           f"    -e {max_errors}"
-        )
+           f" --chdir /cfs/klemming/home/a/andlar5/cppipeline2/dardel"
+           f" run_cellprofiler_singularity_dardel.sh"
+           f" -d /cpp_work/input/{sub_id}"
+           f" -o /cpp_work/output/{sub_id}"
+           f" -w {workers}"
+           f" -e {max_errors}")
 
     logging.debug(f"cmd: {cmd}")
-
     return cmd
 
 def exec_ssh_sbatch_cmd(cmd):
@@ -676,6 +773,7 @@ def exec_ssh_sbatch_cmd(cmd):
     except subprocess.CalledProcessError as e:
         error_message = f"Error: {e.returncode}\n{e.output}"
         logging.error(error_message)
+        raise e
 
     return job_id
 
@@ -736,19 +834,17 @@ def fetch_finished_job_families_dardel(cursor, connection):
 
                 job_path = os.path.join(sub_analysis_out_path, job)
 
-                #logging.indebugfo(f'job_path {job_path}')
-
                 if os.path.exists(os.path.join(job_path, "error")):
                     # skip this one
                     logging.debug(f"Error job {job}")
                 elif os.path.exists(os.path.join(job_path, "finished")):
                     finished_jobs[job] = {"metadata": {"name": job, "sub_id": sub_id, "analysis_id": analysis_id}}
-                    logging.debug(f"Job finished: {job}")
 
             logging.debug(f"Finished jobs after this sub {str(len(finished_jobs))}")
 
 
-    logging.info("Finished jobs done " + str(len(finished_jobs)))
+    logging.info("Finished jobs " + str(len(finished_jobs)))
+
 
     # continue processing the finished jobs
     job_buckets = {}
@@ -765,13 +861,14 @@ def fetch_finished_job_families_dardel(cursor, connection):
             job_buckets[job_family] = [job]
 
 
-    logging.info("Finished buckets: " + str(len(job_buckets)))
+    logging.info(f"Finished buckets len: {len(job_buckets)}")
+    logging.info(f"Finished buckets: {job_buckets.keys()}")
 
     # fetch each familys total number of jobs and compare with the total count
     family_job_count = {}
     finished_families = {}
     for family_name, job_list in job_buckets.items():
-
+        logging.info(f"family_name {family_name}")
         # save the total job count for this family
         family_job_count = get_family_job_count_from_job_name(job_list[0]['metadata']['name'])
         logging.info(f"fam-job-count: {family_job_count}\tfinished-job-list-len: {len(job_list)}")
@@ -874,9 +971,11 @@ def merge_family_jobs_csv_to_parquet(analysis: Analysis, db: Database):
         file_list = filename_dict.setdefault(filename, [])
         file_list.append(file)
 
+    logging.debug(filename_dict)
+
     # some files should not be concatenated but only one file should be copied
     # They are being put here into a separate dict and then one file is renemed to another extension than csv
-    excludes = ["_experiment_", "_experiment.csv", 'Experiment.csv']
+    excludes = ["qcRAW_experiment_", "icf_experiment_" "_experiment.csv", 'Experiment.csv']
     filename_excluded = {}
     for exclude in excludes:
         for key in list(filename_dict.keys()):
@@ -884,20 +983,25 @@ def merge_family_jobs_csv_to_parquet(analysis: Analysis, db: Database):
                 filename_excluded[key] = filename_dict[key]
                 del filename_dict[key]
 
+    logging.debug(filename_dict)
+
     # concat all csv-files (per filename), loop filename(key)
     for filename in filename_dict.keys():
 
         start = time.time()
 
         files = filename_dict[filename]
-        n = 0
 
         # create concat-csv with all files with current filename, e.g experiment, nuclei, cytoplasm
         is_header_already_included = False
         tmp_csvfile = os.path.join('/tmp/', filename + '.merged.csv.tmp')
         try:
             with open(tmp_csvfile, 'w') as csvout:
-                for file in files:
+                for fileCount, file in enumerate(files):
+                    if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+                        df = pd.read_csv(file, engine="c")
+                        logging.debug(f"Number of columns in DataFrame: {len(df.columns)}")
+
                     with open(file, "r") as f:
                         # only include header once
                         if is_header_already_included:
@@ -906,24 +1010,25 @@ def merge_family_jobs_csv_to_parquet(analysis: Analysis, db: Database):
                             csvout.write(row)
                             is_header_already_included = True
 
-                    if n % 500 == 0:
-                        logging.info(f'{n}/{len(files)} {filename}')
-                    n = n+1
+                    if fileCount % 500 == 0:
+                        logging.info(f'{fileCount}/{len(files)} {filename}')
 
             logging.debug(f'done concat csv {filename}')
             logging.debug(f"elapsed: {(time.time() - start):.3f}")
-            pyarrow.set_cpu_count(5)
             logging.debug(f'start pd.read_csv {tmp_csvfile}')
-            df = pd.read_csv(tmp_csvfile, engine='pyarrow')
-            logging.debug(f'done pd.read_csv {tmp_csvfile}')
-            os.remove(tmp_csvfile)
+            df = pd.read_csv(tmp_csvfile, engine="c")
+            #df = pd.read_csv(tmp_csvfile, engine='pyarrow', encoding='utf-8')
+            logging.debug(f'done pd.read_csv ncols: {len(df.columns)} file: {tmp_csvfile}')
+            #if logging.getLogger().getEffectiveLevel() != logging.DEBUG:
+            #    os.remove(tmp_csvfile)
             logging.info(f'done concat {filename}')
             logging.info(f"elapsed: {(time.time() - start):.3f}")
             logging.info(f'start save as parquet {filename}')
             df = to32bit(df)
             parquetfilename = os.path.splitext(filename)[0] + '.parquet'
             parquetfile = os.path.join(analysis.analysis_path, parquetfilename)
-            df.to_parquet(parquetfile)
+            pyarrow.set_cpu_count(5)
+            df.to_parquet(parquetfile, engine="pyarrow")
             logging.info(f'done save as parquet {parquetfile}')
             logging.info(f"elapsed: {(time.time() - start):.3f}")
 
@@ -932,12 +1037,12 @@ def merge_family_jobs_csv_to_parquet(analysis: Analysis, db: Database):
             logging.error(errormessage)
             db.set_sub_analysis_error(analysis, errormessage)
 
-
             # delete all jobs for this sub_analysis
             delete_jobs(analysis.analysis_id)
 
         finally:
-            if os.path.exists(tmp_csvfile):
+
+            if os.path.exists(tmp_csvfile): #and logging.getLogger().getEffectiveLevel() != logging.DEBUG:
                 os.remove(tmp_csvfile)
 
     logging.info("done merge_family_jobs_csv_to_parquet")
@@ -949,7 +1054,7 @@ def delete_jobs(analysis_sub_id):
 def copy_results_to_input(to_dir, from_dir):
     logging.info("Inside copy_results_to_input")
     # List of file suffixes to skip, in lower case for case-insensitive comparison
-    skip_suffixes = ['.csv', '.log', '.png', '.tif', '.tiff', 'finished']
+    skip_suffixes = ['.csv', '.log', '.png', '.tif', '.tiff', 'finished', "error"]
 
     # Check if the source (input) directory exists
     if not os.path.exists(from_dir):
@@ -1013,7 +1118,7 @@ def move_job_results_to_storage(family_name, job_list, storage_root):
     logging.info("Inside move_job_results_to_storage")
 
     skip_suffixes = ['.csv', '.log']
-    skip_files = ['finished']
+    skip_files = ['finished', 'error']
 
     files_created = []
 
@@ -1053,6 +1158,10 @@ def move_job_results_to_storage(family_name, job_list, storage_root):
 
         # keep only the filename in result
         filename = pathlib.Path(result_file).name
+
+        # create a folder for the file if needed
+        subdir_name = os.path.dirname(filename)
+        os.makedirs(f"{storage_root['full']}/{subdir_name}", exist_ok=True)
 
         # move the file to the storage location
         shutil.move(f"{result_file}", f"{storage_root['full']}/{filename}")
@@ -1547,7 +1656,7 @@ def main():
 
     try:
 
-        log_level = logging.DEBUG if is_debug() else logging.INFO
+        log_level = logging.INFO if is_debug() else logging.INFO
         setup_logging(log_level)
 
         logging.info("isdebug:" + str(is_debug()))
@@ -1579,14 +1688,14 @@ def main():
                 for family_name, job_list in finished_families.items():
 
                     sub_analysis_id = get_analysis_sub_id_from_family_name(family_name)
-                    analysis_id = get_analysis_id_from_family_name(family_name)
+                    #analysis_id = get_analysis_id_from_family_name(family_name)
 
                     # final results should be stored in an analysis id based folder e.g. all sub ids beling to the same analyiss id sould be stored in the same folder
                     storage_paths = get_storage_paths_from_sub_analysis_id(cursor, sub_analysis_id)
 
                     # merge all job csvs into family csv
-                    analysis = Database.get_instance().get_analysis_from_sub_id(sub_analysis_id)
-                    files_created = merge_family_jobs_csv_to_parquet(analysis, Database.get_instance())
+                    #analysis = Database.get_instance().get_analysis_from_sub_id(sub_analysis_id)
+                    #files_created = merge_family_jobs_csv_to_parquet(analysis, Database.get_instance())
 
                     # move all files to storage, e.g. results folder
                     files_created = move_job_results_to_storage(family_name, job_list, storage_paths)
