@@ -7,8 +7,8 @@ RUN apt update && \
 # install python packages
 RUN pip3 install psycopg2-binary \
                  kubernetes \
-                 pandas==1.5 \
-                 pyarrow==10 \
+                 pandas==2.2 \
+                 pyarrow==17 \
                  python-dotenv
 
 

@@ -9,5 +9,3 @@ fi
 
 docker build -t ghcr.io/pharmbio/cpp2_master:stable .
 docker push ghcr.io/pharmbio/cpp2_master:stable
-
-
