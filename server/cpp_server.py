@@ -27,7 +27,9 @@ from typing import List, Dict, Any
 
 from database import Database
 from database import Analysis
+from file_sync_utils import SyncManager
 import hpc_utils
+from config import CONFIG
 
 def create_job_id(analysis_id, sub_analysis_id, random_identifier, job_number, n_jobs):
     return f"{sub_analysis_id}-{random_identifier}-{job_number}-{n_jobs}-{analysis_id}"
@@ -188,46 +190,6 @@ def copy_dependant_results_to_input(to_dir, from_dir):
             # Log skipping of the file
             logging.debug(f"File {source} skipped due to not matching include suffixes.")
 
-def build_ssh_cmd_sbatch_dardel(analysis: Analysis):
-
-    logging.info(f"Inside submit_sbatch_to_dardel: {analysis.sub_id}, sub_type {analysis.sub_type}")
-
-    cpp_config = load_cpp_config()
-    dardel_config = cpp_config['cluster']['dardel']
-    resources = dardel_config['resources']
-    user = dardel_config['user']
-    hostname = dardel_config['hostname']
-    account = dardel_config['account']
-    max_errors = 10
-
-    # Resource subtype configuration based on sub_type
-    resource_subtype = resources.get(analysis.sub_type, resources['default'])
-    partition = resource_subtype['partition']
-    nTasks = resource_subtype.get('nTasks')
-    mem = resource_subtype['mem']
-    time = resource_subtype['time']
-    workers = resource_subtype['workers']
-
-    # Command construction using f-string
-    cmd = (f"ssh -o StrictHostKeyChecking=no {user}@{hostname} sbatch"
-           f" --partition {partition}"
-           f" --mem {mem}"
-           f"{f' -n {nTasks}' if nTasks is not None else ''}"
-           f" -t {time}"
-           f" --account {account}"
-           f" --job-name=cpp_{analysis.id}_{analysis.sub_id}_{analysis.sub_type}"
-           f" --output=logs/{analysis.sub_id}-{analysis.sub_type}-slurm.%j.out"
-           f" --error=logs/{analysis.sub_id}-{analysis.sub_type}-slurm.%j.out"
-           f" --chdir /cfs/klemming/home/a/andlar5/cppipeline2/dardel"
-           f" run_cellprofiler_singularity_dardel.sh"
-           f" -d /cpp_work/input/{analysis.sub_id}"
-           f" -o /cpp_work/output/{analysis.sub_id}"
-           f" -w {workers}"
-           f" -e {max_errors}")
-
-    logging.debug(f"cmd: {cmd}")
-    return cmd
-
 
 def handle_new_analyses(cursor, connection):
     logging.info('Inside handle_new_jobs')
@@ -253,13 +215,18 @@ def handle_analysis_cellprofiler_hpc(analysis: Analysis):
         cmd = prepare_analysis_cellprofiler_hpc(analysis)
 
         # write sbatch file to input dir (for debug and re-submit functionality)
-        sbatch_out_file = f"{analysis.input_dir()}/sbatch.sh"
+        sbatch_out_file = f"{analysis.sub_input_dir}/sbatch.sh"
         logging.debug(f"sbatch_out_file: {sbatch_out_file}")
         with open(sbatch_out_file, "w") as file:
             file.write(cmd)
 
+        ## sync input dir to hpc
+        #uppmax_cfg = CONFIG.cluster.get('rackham')
+        #sync_manager = SyncManager(uppmax_cfg.get('user'), uppmax_cfg.get('hostname'), uppmax_cfg.get('work_dir'))
+        #sync_manager.sync_input_dir(analysis.sub_id)
+
         # submit sbatch job via ssh
-        job_id = exec_ssh_sbatch_cmd(cmd)
+        job_id = hpc_utils.exec_ssh_sbatch_cmd(cmd)
 
         if job_id:
             update_sub_analysis_status_to_db(connection, cursor, analysis.id(), analysis.sub_id(), f"submitted, job_id={job_id}")
@@ -272,8 +239,6 @@ def handle_analysis_cellprofiler_hpc(analysis: Analysis):
 def prepare_analysis_cellprofiler_hpc(analysis: Analysis):
 
         logging.info(f"Inside prepare_analysis_cellprofiler_hpc, analysis: {analysis.raw_data}")
-
-
 
         # get cellprofiler-version
         logging.debug(f"pipeline: {analysis.pipeline_file}")
@@ -352,7 +317,7 @@ def prepare_analysis_cellprofiler_hpc(analysis: Analysis):
         # Write all results from dependant sub analyses into the input dir
         copy_dependant_results_to_input(analysis.sub_input_dir, analysis.results_dir)
 
-        cmd = build_ssh_cmd_sbatch_dardel(analysis)
+        cmd = hpc_utils.build_ssh_cmd_sbatch_hpc(analysis)
 
         return cmd
 

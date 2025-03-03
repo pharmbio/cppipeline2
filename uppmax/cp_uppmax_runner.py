@@ -84,13 +84,15 @@ class CSVToParquetConverter:
                     if fileCount % 500 == 0:
                         logging.info(f'{fileCount}/{len(files)} {filename}')
 
-
                 logging.info(f'done concat csv {filename}')
                 parquetfilename = os.path.splitext(filename)[0] + '.parquet'
                 parquetfile = os.path.join(self.output_path, parquetfilename)
 
                 self.csv_to_parquet_chunked(tmp_csvfile, parquetfile)
                 logging.info(f"Elapsed time for {filename}: {(time.time() - start):.3f} seconds")
+
+
+
 
             except Exception as e:
                 logging.error(f"Failed during concat csv files, error: {e}")
@@ -105,18 +107,21 @@ def sync_output_dir_to_remote(local_path):
     logging.debug(f"inside sync_output_dir_to_remote local_path {local_path}")
     from_local_path = local_path.rstrip('/')
     remote_path = "/share/" #os.path.join("/share/", os.path.dirname(from_local_path))
-    to_remote_path = f"guestserver:{remote_path}"
+    ssh_host_config = "guestserver-cpp-worker"
+    to_remote_path = f"{ssh_host_config}:{remote_path}"
     logging.debug(f"to_remote_path {to_remote_path}")
     sync_with_rsync_relative(from_local_path, to_remote_path)
 
-def sync_input_dir(input_dir):
-    from_remote_path = f"guestserver:/share{input_dir}/*"
-    to_local_path = input_dir
+def sync_input_dir(local_dir, remote_dir):
+    ssh_host_config = "guestserver-cpp-worker"
+    from_remote_path = f"{ssh_host_config}:/share{remote_dir}/*"
+    to_local_path = local_dir
     sync_with_rsync(from_remote_path, to_local_path)
 
-def sync_pipelines_dir(results_dir):
-    from_remote_path = f"guestserver:/share{results_dir}/*"
-    to_local_path = results_dir
+def sync_pipelines_dir(local_dir, remote_dir):
+    ssh_host_config = "guestserver-cpp-worker"
+    from_remote_path = f"{ssh_host_config}:/share{remote_dir}/*"
+    to_local_path = local_dir
     sync_with_rsync(from_remote_path, to_local_path)
 
 def sync_with_rsync(from_path, to_path):
@@ -133,11 +138,21 @@ def sync_with_rsync(from_path, to_path):
     result = subprocess.run(rsync_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     logging.debug(result.stdout.decode())
 
-def sync_with_rsync_relative(from_path, to_path):
-    # Prepare the rsync command
-    rsync_command = ["rsync", "-av","--relative", "--no-perms", "--omit-dir-times", from_path, to_path]
+def sync_with_rsync_relative(from_path, to_path, excludes=None):
+    if excludes is None:
+        excludes = []
 
-    logging.debug(f"rsync_command {rsync_command}")
+    # Start with the base command
+    rsync_command = ["rsync", "-av", "--relative", "--no-perms", "--omit-dir-times"]
+
+    # Append each exclude option
+    for pattern in excludes:
+        rsync_command.append(f"--exclude={pattern}")
+
+    # Append source and destination paths
+    rsync_command.extend([from_path, to_path])
+
+    logging.debug(f"rsync_command: {rsync_command}")
 
     # Execute the command
     result = subprocess.run(rsync_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -146,7 +161,7 @@ def sync_with_rsync_relative(from_path, to_path):
 def stage_images_from_file_list(stage_images_file):
     logging.info("Inside stage_images_from_file_list")
     # Define the source and target directories
-    remote_ssh_host_config = "guestserver"
+    remote_ssh_host_config = "guestserver-cpp-worker"
     local_stage_directory = "/"  # Adjust the path as necessary
 
     # Ensure the local directory exists
@@ -266,11 +281,6 @@ def run_cmd(cmd):
         raise
 
     finally:
-        # Sync output dir back to fileserver
-        if output_dir:
-            logging.debug("finally sync output dir")
-            set_permissions_recursive(output_dir, 0o777)
-            sync_output_dir_to_remote(output_dir)
 
         # Remove the process from the active list and check if it needs to be terminated
         if proc is not None:  # Check if proc is defined
@@ -309,6 +319,9 @@ def run_all_commands_from_threadpool(cmd_file, max_workers, max_errors):
 
             if errors > max_errors:
                 raise Exception(f"There are more errors than max_errors, errors {errors}")
+
+
+
 
 def main():
 
@@ -361,7 +374,7 @@ def main():
                                         chunk_size=10000)
         converter.merge_csv_to_parquet()
 
-        # Sync output dir back to fileserver
+        # Sync output dir back to fileserver (or S3)
         if output_dir:
             logging.info("sync output dir including parquet files")
             sync_output_dir_to_remote(output_dir)

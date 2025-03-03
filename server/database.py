@@ -185,25 +185,35 @@ class Database:
     # -------------------------------------------------------------------------
     # New Method: Get the First (Minimum) Z Plane.
     # -------------------------------------------------------------------------
-    def get_first_z_plane(self, acq_id) -> Optional[Any]:
+    def get_middle_z_plane(self, acq_id) -> Optional[Any]:
         logging.info(f'Fetching minimum z-plane for plate acquisition ID: {acq_id}')
         conn = None
         try:
             conn = self.get_connection()
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                query = (
-                    "SELECT min(z) AS min_z "
-                    "FROM images "
-                    "WHERE plate_acquisition_id = %s"
-                )
+                # Get a sorted list of unique z values
+                query = """
+                        SELECT DISTINCT z
+                        FROM images
+                        WHERE plate_acquisition_id = %s
+                        ORDER BY z ASC
+                        """
                 logging.info('Executing query: %s with ID: %s', query.strip(), acq_id)
                 cursor.execute(query, (acq_id,))
-                result = cursor.fetchone()
-                if result:
-                    return result['min_z']
+                results = cursor.fetchall()
+                
+                # Create a list of unique z values
+                z_values = [row['z'] for row in results]
+                
+                if z_values:
+                    # Determine the middle index (using lower middle for even counts)
+                    middle_index = (len(z_values) - 1) // 2
+                    logging.info(f"Total unique z values: {len(z_values)}. Middle index: {middle_index}")
+                    return z_values[middle_index]
                 else:
-                    logging.error("No result returned for get_first_z_plane")
+                    logging.warning('No distinct z values found for plate acquisition ID: %s', acq_id)
                     return None
+                
         except Exception as e:
             logging.error(f"Error fetching first z plane: {e}")
             return None
@@ -302,6 +312,30 @@ class Database:
             if conn:
                 self.release_connection(conn)
         return analyses
+
+    def get_analysis(self, sub_id: int) -> Optional[Analysis]:
+        logging.info('Fetching analysis for sub_id')
+        query = (
+            "SELECT * "
+            "FROM image_sub_analyses_v1 "
+            "WHERE sub_id = %s"
+        )
+        analysis_obj: Optional[Analysis] = None
+        conn = None
+        try:
+            conn = self.get_connection()
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                logging.debug(query)
+                cursor.execute(query, [sub_id])
+                result = cursor.fetchone()  # Get a single row.
+                if result is not None:
+                    analysis_obj = Analysis(result)
+        except Exception as e:
+            logging.error(f"An error occurred: {e}")
+        finally:
+            if conn:
+                self.release_connection(conn)
+        return analysis_obj
 
     def set_sub_analysis_error(self, analysis: Analysis, errormessage: str):
         logging.error(f"TODO implement set sub analysis error, errormessage: {errormessage}")
@@ -468,7 +502,7 @@ class Analysis:
                 logging.error("Missing plate_acquisition_id in analysis data")
                 return []
             db = Database.get_instance()
-            z_val = db.get_first_z_plane(self.plate_acquisition_id)
+            z_val = db.get_middle_z_plane(self.plate_acquisition_id)
             return [z_val] if z_val is not None else []
 
     def get_images(self) -> List[Image]:
