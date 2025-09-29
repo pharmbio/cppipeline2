@@ -1,16 +1,35 @@
 #!/usr/bin/env python3
 import logging
 import os
+import sys
 import time
 import subprocess
 import concurrent.futures
+from pathlib import Path
+from dataclasses import dataclass
+from typing import List, Optional
+
 import pandas as pd
 import pyarrow
 import pyarrow.parquet as pq
-import pathlib
 
-# Global list to track active subprocesses
-active_processes = []
+from s3_client_wrapper import S3ClientWrapper
+
+# ----------------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------------
+@dataclass
+class RunnerConfig:
+    stage_root_dir: str = os.environ.get("STAGE_ROOT_DIR", "")
+    input_dir: str = os.environ.get("INPUT_DIR", "/cpp_work/input")
+    output_dir: str = os.environ.get("OUTPUT_DIR", "/cpp_work/output")
+    results_dir: str = os.environ.get("RESULT_DIR", "/cpp_work/result")
+    pipelines_dir: str = "/cpp_work/pipelines"
+    max_workers: int = int(os.environ.get("MAX_WORKERS", "16"))
+    max_errors: int = int(os.environ.get("MAX_ERRORS", "5"))
+    omp_threads: int = int(os.environ.get("OMP_NUM_THREADS", "1"))
+    cmd_ix_to_run: int = int(os.environ.get("CMD_IX_TO_RUN", "-1"))
+    s3_bucket: str = os.environ.get("S3_BUCKET", "mikro")
 
 class CSVToParquetConverter:
     def __init__(self, input_path, output_path, chunk_size=10000):
@@ -19,10 +38,10 @@ class CSVToParquetConverter:
         self.chunk_size = chunk_size
 
     @staticmethod
-    def to32bit(df):
+    def _to32bit(df):
         return df.astype({c: str(df[c].dtype).replace('64', '32') for c in df.columns})
 
-    def csv_to_parquet_chunked(self, csv_file_path, parquet_file_path):
+    def _csv_to_parquet_chunked(self, csv_file_path, parquet_file_path):
         # Create a Parquet writer
         parquet_writer = None
         schema = None
@@ -31,29 +50,29 @@ class CSVToParquetConverter:
 
         # Read the CSV file in chunks
         for chunk in pd.read_csv(csv_file_path, chunksize=self.chunk_size):
-            print("processing a new chunk")
-            chunk = self.to32bit(chunk)
+            logging.debug("processing a new chunk")
+            chunk = self._to32bit(chunk)
             # Convert the chunk to a PyArrow Table
             table = pyarrow.Table.from_pandas(chunk)
-            print("done df to table")
+            logging.debug("done df to table")
             if parquet_writer is None:
                 # Initialize the Parquet writer with the schema of the first chunk
                 schema = table.schema
                 parquet_writer = pq.ParquetWriter(parquet_file_path, schema=schema, compression='snappy')
 
             # Write the table chunk to the Parquet file
-            print("before write table")
+            logging.debug("before write table")
             parquet_writer.write_table(table)
-            print("done write table")
+            logging.debug("done write table")
 
         # Close the Parquet writer if it was initialized
         if parquet_writer:
             parquet_writer.close()
 
-    def merge_csv_to_parquet(self):
-        logging.info("Inside merge_csv_to_parquet")
+    def merge_csv_and_convert_to_parquet(self):
+        logging.info("Inside merge_csv_and_convert_to_parquet")
 
-        all_csv_files = pathlib.Path(self.input_path).rglob("*.csv")
+        all_csv_files = Path(self.input_path).rglob("*.csv")
         filename_dict = {}
         for file in all_csv_files:
             filename = os.path.basename(file)
@@ -88,10 +107,8 @@ class CSVToParquetConverter:
                 parquetfilename = os.path.splitext(filename)[0] + '.parquet'
                 parquetfile = os.path.join(self.output_path, parquetfilename)
 
-                self.csv_to_parquet_chunked(tmp_csvfile, parquetfile)
+                self._csv_to_parquet_chunked(tmp_csvfile, parquetfile)
                 logging.info(f"Elapsed time for {filename}: {(time.time() - start):.3f} seconds")
-
-
 
 
             except Exception as e:
@@ -103,96 +120,111 @@ class CSVToParquetConverter:
 
         logging.info("Done merging CSV to Parquet")
 
-def sync_output_dir_to_remote(local_path):
-    logging.debug(f"inside sync_output_dir_to_remote local_path {local_path}")
-    from_local_path = local_path.rstrip('/')
-    remote_path = "/share/" #os.path.join("/share/", os.path.dirname(from_local_path))
-    ssh_host_config = "guestserver-cpp-worker"
-    to_remote_path = f"{ssh_host_config}:{remote_path}"
-    logging.debug(f"to_remote_path {to_remote_path}")
-    sync_with_rsync_relative(from_local_path, to_remote_path)
 
-def sync_input_dir(local_dir, remote_dir):
-    ssh_host_config = "guestserver-cpp-worker"
-    from_remote_path = f"{ssh_host_config}:/share{remote_dir}/*"
-    to_local_path = local_dir
-    sync_with_rsync(from_remote_path, to_local_path)
+# ----------------------------------------------------------------------------
+# Sync Utilities
+# ----------------------------------------------------------------------------
+def _run_rsync(src: str, dst: str, relative: bool = False, excludes: Optional[List[str]] = None) -> None:
+    cmd = ["rsync", "-av"]
+    if relative:
+        cmd += ["--relative", "--no-perms", "--omit-dir-times"]
+    if excludes:
+        for pat in excludes:
+            cmd.append(f"--exclude={pat}")
+    cmd += [src, dst]
+    logging.debug("Rsync command: %s", cmd)
+    subprocess.run(cmd, check=True)
 
-def sync_pipelines_dir(local_dir, remote_dir):
-    ssh_host_config = "guestserver-cpp-worker"
-    from_remote_path = f"{ssh_host_config}:/share{remote_dir}/*"
-    to_local_path = local_dir
-    sync_with_rsync(from_remote_path, to_local_path)
+def sync_input_dir(local: str, remote: str) -> None:
+    _run_rsync(f"guestserver-cpp-worker:{remote}/*", local)
 
-def sync_with_rsync(from_path, to_path):
-    # Prepare the rsync command
-    rsync_command = ["rsync", "-av", from_path, to_path]
+def sync_pipelines_dir(local: str, remote: str) -> None:
+    _run_rsync(f"guestserver-cpp-worker:{remote}/*", local)
 
-    logging.debug(f"rsync_command {rsync_command}")
+def sync_output_dir_to_remote(local: str) -> None:
+    _run_rsync(local.rstrip('/'), f"guestserver-cpp-worker:/share")
 
-    # make sure to_path path exists
-    if not os.path.exists(to_path):
-        os.makedirs(to_path, exist_ok=True)
 
-    # Execute the command
-    result = subprocess.run(rsync_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    logging.debug(result.stdout.decode())
+def download_from_s3(
+    client_wrapper: S3ClientWrapper,
+    bucket: str,
+    key: str,
+    dest: str) -> bool:
+    """
+    Try to copy s3://{bucket}/{key} → dest via boto3.
+    Returns True if the object was fetched successfully, False otherwise.
+    """
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    try:
+        s3 = client_wrapper.get_fresh_s3_client()
+        # download_file will raise if 404, etc
+        s3.download_file(bucket, key, dest)
+        logging.info(f"[stage][S3] fetched {key} → {dest}")
+        return True
+    except client_wrapper.s3_client.exceptions.NoSuchKey:
+        logging.debug(f"[stage][S3] {key} not found in bucket {bucket}")
+        return False
+    except Exception as e:
+        logging.warning(f"[stage][S3] error fetching {key}: {e}")
+        return False
 
-def sync_with_rsync_relative(from_path, to_path, excludes=None):
-    if excludes is None:
-        excludes = []
-
-    # Start with the base command
-    rsync_command = ["rsync", "-av", "--relative", "--no-perms", "--omit-dir-times"]
-
-    # Append each exclude option
-    for pattern in excludes:
-        rsync_command.append(f"--exclude={pattern}")
-
-    # Append source and destination paths
-    rsync_command.extend([from_path, to_path])
-
-    logging.debug(f"rsync_command: {rsync_command}")
-
-    # Execute the command
-    result = subprocess.run(rsync_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    logging.debug(result.stdout.decode())
-
-def stage_images_from_file_list(stage_images_file):
-    logging.info("Inside stage_images_from_file_list")
-    # Define the source and target directories
-    remote_ssh_host_config = "guestserver-cpp-worker"
-    local_stage_directory = "/"  # Adjust the path as necessary
-
-    # Ensure the local directory exists
-    if not os.path.exists(local_stage_directory):
-        os.makedirs(local_stage_directory, exist_ok=True)
-
-    # Build the rsync command with additional options to ignore ownership and permissions
-    rsync_command = [
+def download_via_rsync(remote: str, key: str, dest: str) -> None:
+    """
+    Rsync remote:/{key} → dest.  Raises if it fails.
+    """
+    rsync_cmd = [
         "rsync", "-av",
         "--no-owner", "--no-group", "--no-perms", "--omit-dir-times",
-        "--files-from=" + stage_images_file,
-        f"{remote_ssh_host_config}:/",  # Assuming the paths in stage_images.txt are absolute paths
-        local_stage_directory
+        f"{remote}:/{key}", dest
     ]
-
-    # Log the rsync command
-    logging.info(f"Executing rsync command: {' '.join(rsync_command)}")
-
-    # Execute the rsync command
     try:
-        result = subprocess.run(rsync_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        # Check for errors
-        if result.returncode != 0:
-            logging.error(f"Rsync error: {result.stderr.decode()}")
-        else:
-            logging.debug(f"Rsync output: {result.stdout.decode()}")
-    except Exception as e:
-        logging.error(f"Failed to execute rsync command: {e}")
-        raise e
+        subprocess.run(rsync_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        logging.info(f"[stage][rsync] fetched {key}")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"[stage][rsync] failed for {key}: {e}")
+        # You can choose to re-raise if you want the pipeline to abort:
+        # raise
 
-    logging.info(f"Staging completed successfully to {local_stage_directory}")
+
+def stage_single_file(
+    src_path: str,
+    local_stage_directory: str,
+    s3_bucket: Optional[str] = None) -> None:
+    """
+    Stage one file: first try S3, then rsync.  Skip if already exists.
+    """
+    key = src_path.lstrip("/")
+    dest = os.path.join(local_stage_directory, key)
+
+    if os.path.exists(dest):
+        logging.debug(f"[stage] {dest} exists, skipping")
+        return
+
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+    if s3_bucket and download_from_s3(s3_bucket, key, dest):
+        return
+
+    download_via_rsync("guestserver-cpp-worker", key, dest)
+
+
+def stage_images_from_file_list(
+    stage_images_file: str,
+    local_stage_directory: str,
+    s3_bucket: Optional[str] = None) -> None:
+    """
+    Loop over each line in stage_images_file and call stage_single_file().
+    """
+    logging.info(f"[stage] staging images listed in {stage_images_file}")
+    #os.makedirs(local_stage_directory, exist_ok=True)
+
+    with open(stage_images_file, "r") as f:
+        for line in f:
+            src = line.strip()
+            if src:
+                stage_single_file(src, local_stage_directory, s3_bucket)
+
+    logging.info(f"[stage] done staging to {local_stage_directory}")
 
 
 def set_permissions_recursive(path, permissions=0o777):
@@ -209,6 +241,10 @@ def set_permissions_recursive(path, permissions=0o777):
     logging.debug(f"done set_permissions_recursive {path}")
 
 
+# ----------------------------------------------------------------------------
+# Command Runner
+# ----------------------------------------------------------------------------
+active_processes: List[subprocess.Popen] = []
 def run_cmd(cmd):
     """
     Execute a command (usually done in a separate thread)
@@ -254,6 +290,7 @@ def run_cmd(cmd):
         # image_list = parse_images_from_datafile(data_file)
 
         # Execute the command and redirect stdout and stderr to a log file
+        logging.info(f"cp logfile: {log_file_path}")
         with open(log_file_path, 'w') as log_file:
             proc = subprocess.Popen(cmd, shell=True, stdout=log_file, stderr=subprocess.STDOUT)
             active_processes.append(proc)
@@ -291,12 +328,28 @@ def run_cmd(cmd):
 
         logging.info(f"Done with job cmd: {cmd}")
 
-def run_all_commands_from_threadpool(cmd_file, max_workers, max_errors):
-    # read all cellprofiler commands to be executed
-    with open(cmd_file, "r") as file:
-        cmds = file.readlines()
+
+# ----------------------------------------------------------------------------
+# Thread Pool Executor
+# ----------------------------------------------------------------------------
+def run_all_commands_via_threadpool(
+    cmd_file: str,
+    max_workers: int,
+    max_errors: int,
+    cmd_ix_to_run: int = -1) -> None:
+
+    # read & clean commands from leading/trailing white spaces
+    with open(cmd_file, "r") as f:
+        cmds = [line.strip() for line in f if line.strip()]
 
     logging.debug(f"all cmds: {cmds}")
+
+    # optional narrow to just one -1 means all
+    if cmd_ix_to_run >= 0:
+        if cmd_ix_to_run < 0 or cmd_ix_to_run >= len(cmds):
+            raise IndexError(f"cmd_ix_to_run {cmd_ix_to_run} out of range (0–{len(cmds)-1})")
+        logging.info(f"Running only command index {cmd_ix_to_run}")
+        cmds = [cmds[cmd_ix_to_run]]
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(run_cmd, cmd): cmd for cmd in cmds}
@@ -310,8 +363,8 @@ def run_all_commands_from_threadpool(cmd_file, max_workers, max_errors):
             try:
                 result = future.result()  # You can capture the result if needed
                 finished += 1
-            except Exception as e:
-                logging.error(f"Error running command {cmd}", e)
+            except Exception:
+                logging.exception("Error running command %s", cmd)
                 errors += 1
 
             pending -= 1
@@ -321,63 +374,61 @@ def run_all_commands_from_threadpool(cmd_file, max_workers, max_errors):
                 raise Exception(f"There are more errors than max_errors, errors {errors}")
 
 
-
-
-def main():
-
-    # Configure logging
+def setup_logging(level=logging.INFO):
     logging.basicConfig(
-        format='%(asctime)s,%(msecs)d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
+        format='%(asctime)s %(levelname)-8s %(message)s',
         datefmt='%y-%m-%d %H:%M:%S',
-        level=logging.INFO
+        level=level,
     )
+
+
+def testrun1(cfg: Optional[RunnerConfig] = None) -> RunnerConfig:
+
+    setup_logging(level=logging.DEBUG)
+    if cfg is None:
+      cfg = RunnerConfig()
+
+    sync_input_dir(f"{cfg.stage_root_dir}{cfg.input_dir}", f"/share{cfg.input_dir}")
+
+def testrunStage(cfg: Optional[RunnerConfig] = None) -> RunnerConfig:
+
+    setup_logging(level=logging.DEBUG)
+    if cfg is None:
+      cfg = RunnerConfig()
+
+    stage_images_from_file_list(f'{cfg.input_dir}/stage_images.txt',
+                                   cfg.stage_root_dir,
+                                   s3_bucket=cfg.s3_bucket)
+
+def run_pipeline(cfg: RunnerConfig) -> None:
 
     try:
         start_time = time.time()
 
-        output_dir = os.environ.get('OUTPUT_DIR')
-        logging.info(f"output_dir {output_dir}")
-
-        input_dir = os.environ.get('INPUT_DIR')
-        logging.info(f"input_dir {input_dir}")
-
-        results_dir = os.environ.get('RESULT_DIR')
-        logging.info(f"results_dir {results_dir}")
-
-        max_workers = int(os.environ.get('MAX_WORKERS', default=16))
-        logging.info(f"max_workers {max_workers}")
-
-        max_errors = int(os.environ.get('MAX_ERRORS', default=5))
-        logging.info(f"max_errors {max_errors}")
-
-        logging.info(f"OMP_NUM_THREADS {os.environ.get('OMP_NUM_THREADS')}")
-
-        pipelines_dir = "/cpp_work/pipelines"
-
-        cmd_file = f"{input_dir}/cmds.txt"
+        cmd_file = f"{cfg.input_dir}/cmds.txt"
 
         # sync input dir
-        sync_input_dir(input_dir)
+        sync_input_dir(f"{cfg.input_dir}", f"/share{cfg.input_dir}")
 
         # sync pipelines dir
-        sync_pipelines_dir(pipelines_dir)
+        sync_pipelines_dir(f"{cfg.pipelines_dir}", f"/share{cfg.pipelines_dir}")
 
         # stage images
-        stage_images_from_file_list(f'{input_dir}/stage_images.txt')
+        stage_images_from_file_list(f'{cfg.input_dir}/stage_images.txt',)
 
         # execute all commands with a threadpool
-        run_all_commands_from_threadpool(cmd_file, max_workers, max_errors)
+        run_all_commands_via_threadpool(cmd_file, cfg.max_workers, cfg.max_errors, cfg.cmd_ix_to_run)
 
         # merge all csv into parquet files
-        converter = CSVToParquetConverter(input_path=output_dir,
-                                        output_path=output_dir,
+        converter = CSVToParquetConverter(input_path=cfg.output_dir,
+                                        output_path=cfg.output_dir,
                                         chunk_size=10000)
-        converter.merge_csv_to_parquet()
+        converter.merge_csv_and_convert_to_parquet()
 
         # Sync output dir back to fileserver (or S3)
-        if output_dir:
+        if cfg.output_dir:
             logging.info("sync output dir including parquet files")
-            sync_output_dir_to_remote(output_dir)
+            sync_output_dir_to_remote(cfg.output_dir)
 
         logging.info(f"elapsed: {time.time() - start_time} sek")
 
@@ -388,6 +439,11 @@ def main():
         for p in active_processes:
             p.terminate()
 
+
+def main() -> None:
+    setup_logging()
+    cfg = RunnerConfig()
+    run_pipeline(cfg)
 
 if __name__ == "__main__":
     main()
