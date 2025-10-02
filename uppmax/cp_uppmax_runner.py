@@ -4,10 +4,15 @@ import os
 import sys
 import time
 import subprocess
+import platform
+import csv
 import concurrent.futures
+import shlex
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional
+from botocore.exceptions import ClientError, ConnectTimeoutError, ReadTimeoutError, EndpointConnectionError
+from boto3.s3.transfer import TransferConfig
 
 import pandas as pd
 import pyarrow
@@ -20,7 +25,7 @@ from s3_client_wrapper import S3ClientWrapper
 # ----------------------------------------------------------------------------
 @dataclass
 class RunnerConfig:
-    stage_root_dir: str = os.environ.get("STAGE_ROOT_DIR", "")
+    stage_root_dir: str = os.environ.get("STAGE_ROOT_DIR", "/")
     input_dir: str = os.environ.get("INPUT_DIR", "/cpp_work/input")
     output_dir: str = os.environ.get("OUTPUT_DIR", "/cpp_work/output")
     results_dir: str = os.environ.get("RESULT_DIR", "/cpp_work/result")
@@ -30,6 +35,9 @@ class RunnerConfig:
     omp_threads: int = int(os.environ.get("OMP_NUM_THREADS", "1"))
     cmd_ix_to_run: int = int(os.environ.get("CMD_IX_TO_RUN", "-1"))
     s3_bucket: str = os.environ.get("S3_BUCKET", "mikro")
+    s3_endpoint_url: str = os.environ.get("S3_ENDPOINT_URL", "https://s3.spirula.uppmax.uu.se:8443" )
+    s3_region: Optional[str] = os.environ.get("AWS_DEFAULT_REGION", None) # default not needed
+
 
 class CSVToParquetConverter:
     def __init__(self, input_path, output_path, chunk_size=10000):
@@ -125,9 +133,13 @@ class CSVToParquetConverter:
 # Sync Utilities
 # ----------------------------------------------------------------------------
 def _run_rsync(src: str, dst: str, relative: bool = False, excludes: Optional[List[str]] = None) -> None:
-    cmd = ["rsync", "-av"]
+    cmd = [
+        "rsync", "-av",
+        "--no-owner", "--no-group", "--no-perms",
+        "--omit-dir-times",
+    ]
     if relative:
-        cmd += ["--relative", "--no-perms", "--omit-dir-times"]
+        cmd += ["--relative"]
     if excludes:
         for pat in excludes:
             cmd.append(f"--exclude={pat}")
@@ -136,101 +148,163 @@ def _run_rsync(src: str, dst: str, relative: bool = False, excludes: Optional[Li
     subprocess.run(cmd, check=True)
 
 def sync_input_dir(local: str, remote: str) -> None:
-    _run_rsync(f"guestserver-cpp-worker:{remote}/*", local)
+    _run_rsync(f"guestserver:{remote}/*", local)
 
 def sync_pipelines_dir(local: str, remote: str) -> None:
-    _run_rsync(f"guestserver-cpp-worker:{remote}/*", local)
+    _run_rsync(f"guestserver:{remote}/*", local)
 
 def sync_output_dir_to_remote(local: str) -> None:
-    _run_rsync(local.rstrip('/'), f"guestserver-cpp-worker:/share")
+    _run_rsync(local.rstrip('/'), f"guestserver:/share")
 
+# def download_single_file_via_rsync(remote: str, key: str, dest: str) -> None:
+#     _run_rsync(f"{remote}:/{key}", dest)
 
-def download_from_s3(
-    client_wrapper: S3ClientWrapper,
-    bucket: str,
-    key: str,
-    dest: str) -> bool:
-    """
-    Try to copy s3://{bucket}/{key} → dest via boto3.
-    Returns True if the object was fetched successfully, False otherwise.
-    """
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    try:
-        s3 = client_wrapper.get_fresh_s3_client()
-        # download_file will raise if 404, etc
-        s3.download_file(bucket, key, dest)
-        logging.info(f"[stage][S3] fetched {key} → {dest}")
-        return True
-    except client_wrapper.s3_client.exceptions.NoSuchKey:
-        logging.debug(f"[stage][S3] {key} not found in bucket {bucket}")
-        return False
-    except Exception as e:
-        logging.warning(f"[stage][S3] error fetching {key}: {e}")
-        return False
+def stage_images_via_rsync_files_list(cfg: RunnerConfig, stage_images_file: str) -> None:
 
-def download_via_rsync(remote: str, key: str, dest: str) -> None:
-    """
-    Rsync remote:/{key} → dest.  Raises if it fails.
-    """
-    rsync_cmd = [
+    os.makedirs(cfg.stage_root_dir, exist_ok=True)
+
+    cmd = [
         "rsync", "-av",
         "--no-owner", "--no-group", "--no-perms", "--omit-dir-times",
-        f"{remote}:/{key}", dest
+        f"--files-from={stage_images_file}",
+        "guestserver:/",             # remote host fixed here
+        cfg.stage_root_dir,
     ]
+
+    logging.info("[stage][rsync] starting fetch using file list: %s", stage_images_file)
+    logging.debug("Rsync command: %s", " ".join(shlex.quote(c) for c in cmd))
+
     try:
-        subprocess.run(rsync_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        logging.info(f"[stage][rsync] fetched {key}")
+        subprocess.run(cmd, check=True)
+        logging.info("[stage][rsync] fetch completed")
     except subprocess.CalledProcessError as e:
-        logging.error(f"[stage][rsync] failed for {key}: {e}")
-        # You can choose to re-raise if you want the pipeline to abort:
-        # raise
+        logging.error("[stage][rsync] fetch failed: %s", e)
+        raise
+
+def parse_images_from_datafile(file_path):
+    pathname_data = []
+    with open(file_path, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            for key, value in row.items():
+                if key.startswith("URL_"):
+                    pathname_entry = value
+                    pathname_entry = pathname_entry[5:] # remove "file:" prefix
+                    pathname_data.append(pathname_entry)
+    return pathname_data
 
 
-def stage_single_file(
-    src_path: str,
-    local_stage_directory: str,
-    s3_bucket: Optional[str] = None) -> None:
+def _make_s3_wrapper(cfg: RunnerConfig) -> S3ClientWrapper:
+    return S3ClientWrapper(endpoint_url=cfg.s3_endpoint_url, region=cfg.s3_region)
+
+# def download_from_s3(
+#     client_wrapper: S3ClientWrapper,
+#     bucket: str,
+#     key: str,
+#     dest: str) -> bool:
+#     """
+#     Try to copy s3://{bucket}/{key} → dest via boto3.
+#     Returns True if the object was fetched successfully, False otherwise.
+#     """
+#     os.makedirs(os.path.dirname(dest), exist_ok=True)
+#     try:
+#         s3 = client_wrapper.get_fresh_s3_client()
+#         # download_file will raise if 404, etc
+#         s3.download_file(bucket, key, dest)
+#         logging.info(f"[stage][S3] fetched {key} → {dest}")
+#         return True
+#     except client_wrapper.s3_client.exceptions.NoSuchKey:
+#         logging.debug(f"[stage][S3] {key} not found in bucket {bucket}")
+#         return False
+#     except Exception as e:
+#         logging.warning(f"[stage][S3] error fetching {key}: {e}")
+#         return False
+
+def stage_images_via_s3_files_list(cfg: RunnerConfig, stage_images_file: str) -> None:
     """
-    Stage one file: first try S3, then rsync.  Skip if already exists.
+    Fetch listed files via S3 into cfg.stage_root_dir.
+    Abort on the FIRST error of any kind.
     """
-    key = src_path.lstrip("/")
-    dest = os.path.join(local_stage_directory, key)
+    if not cfg.s3_bucket:
+        raise Exception("Missing s3_bucket in config")
 
-    if os.path.exists(dest):
-        logging.debug(f"[stage] {dest} exists, skipping")
-        return
+    os.makedirs(cfg.stage_root_dir, exist_ok=True)
 
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    # Build the wrapper here (safer for multiprocessing)
+    client_wrapper = _make_s3_wrapper(cfg)
+    s3 = client_wrapper.get_fresh_s3_client()
 
-    if s3_bucket and download_from_s3(s3_bucket, key, dest):
-        return
-
-    download_via_rsync("guestserver-cpp-worker", key, dest)
-
-
-def stage_images_from_file_list(
-    stage_images_file: str,
-    local_stage_directory: str,
-    s3_bucket: Optional[str] = None) -> None:
-    """
-    Loop over each line in stage_images_file and call stage_single_file().
-    """
-    logging.info(f"[stage] staging images listed in {stage_images_file}")
-    #os.makedirs(local_stage_directory, exist_ok=True)
+    xfer_cfg = TransferConfig(num_download_attempts=1, max_concurrency=1)
 
     with open(stage_images_file, "r") as f:
         for line in f:
             src = line.strip()
-            if src:
-                stage_single_file(src, local_stage_directory, s3_bucket)
+            if not src:
+                continue
 
-    logging.info(f"[stage] done staging to {local_stage_directory}")
+            key = src.lstrip("/")
+            dest = os.path.join(cfg.stage_root_dir, key)
 
+            if os.path.exists(dest):
+                logging.debug("[stage][S3] exists, skipping: %s", dest)
+                continue
+
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+            try:
+                s3.download_file(cfg.s3_bucket, key, dest, Config=xfer_cfg)
+                logging.info("[stage][S3] fetched %s → %s", key, dest)
+            except Exception as e:
+                logging.error("[stage][S3] failed for %s: %s", key, e)
+                raise
+
+def stage_images_from_file_list(cfg: RunnerConfig, stage_images_file: str) -> None:
+    """
+    Stage all files listed in stage_images_file into cfg.stage_root_dir.
+    Job-wide sync method (S3 or rsync) is controlled by a flag file.
+    """
+    os.makedirs(cfg.stage_root_dir, exist_ok=True)
+
+    method = get_image_sync_method()
+
+    logging.info("[stage] method=%s, staging %s", method, stage_images_file)
+
+    if method == "s3":
+        try:
+            stage_images_via_s3_files_list(cfg, stage_images_file)
+            logging.info("[stage] S3 succeeded for %s", stage_images_file)
+            return
+        except Exception as e:
+            logging.warning("[stage] S3 failed for %s: %s. Switching to rsync.", stage_images_file, e)
+            set_image_sync_method("rsync")
+
+    # Fallback / chosen path: rsync for the whole list into cfg.stage_root_dir
+    stage_images_via_rsync_files_list(cfg, stage_images_file)
+
+
+def get_sync_method_flag_file_name() -> str:
+    """Return path to a job-specific flag file in /tmp."""
+    job_id = os.environ.get("SLURM_JOB_ID") or "default"
+    return f"/tmp/stage_sync_method_{job_id}.flag"
+
+def get_image_sync_method() -> str:
+    """Return current sync method ('s3' or 'rsync'), defaulting to 's3'."""
+    flag = get_sync_method_flag_file_name()
+    if os.path.exists(flag):
+        with open(flag) as f:
+            val = f.read().strip().lower()
+            return val if val else "s3"
+    return "s3"
+
+def set_image_sync_method(method: str) -> None:
+    """Set the sync method ('s3' or 'rsync')."""
+    with open(get_sync_method_flag_file_name(), "w") as f:
+        f.write(method.strip().lower())
 
 def set_permissions_recursive(path, permissions=0o777):
     logging.debug(f"inside set_permissions_recursive {path}")
 
-    #set permissions for the input directory itself
+    #set permissions for the root
     os.chmod(path, permissions)
 
     for dirpath, dirnames, filenames in os.walk(path):
@@ -245,7 +319,7 @@ def set_permissions_recursive(path, permissions=0o777):
 # Command Runner
 # ----------------------------------------------------------------------------
 active_processes: List[subprocess.Popen] = []
-def run_cmd(cmd):
+def run_cmd(cmd: str, cfg: RunnerConfig):
     """
     Execute a command (usually done in a separate thread)
 
@@ -255,6 +329,8 @@ def run_cmd(cmd):
     """
 
     logging.info(f"run_cmd {cmd}")
+    # use cfg inside here
+    logging.info("run_cmd %s (stage_root=%s)", cmd, cfg.stage_root_dir)
 
     output_dir = None
     proc = None  # Initialize proc outside the try block
@@ -284,7 +360,7 @@ def run_cmd(cmd):
         os.makedirs(output_dir, exist_ok=True)
         os.chmod(output_dir, 0o0777)
 
-        # TODO touch image miles manually because uppmax is mounted with noatime and
+        # TODO touch image files manually because uppmax is mounted with noatime and
         # we want to keep track of when files where last accessed
         ## get images from this commands datafile
         # image_list = parse_images_from_datafile(data_file)
@@ -333,72 +409,90 @@ def run_cmd(cmd):
 # Thread Pool Executor
 # ----------------------------------------------------------------------------
 def run_all_commands_via_threadpool(
-    cmd_file: str,
-    max_workers: int,
-    max_errors: int,
-    cmd_ix_to_run: int = -1) -> None:
+    cfg: RunnerConfig,
+    cmd_file: str) -> None:
 
-    # read & clean commands from leading/trailing white spaces
+    # read & clean commands
     with open(cmd_file, "r") as f:
         cmds = [line.strip() for line in f if line.strip()]
 
-    logging.debug(f"all cmds: {cmds}")
+    if cfg.cmd_ix_to_run >= 0:
+        if cfg.cmd_ix_to_run >= len(cmds):
+            raise IndexError(f"cmd_ix_to_run {cfg.cmd_ix_to_run} out of range (0–{len(cmds)-1})")
+        cmds = [cmds[cfg.cmd_ix_to_run]]
 
-    # optional narrow to just one -1 means all
-    if cmd_ix_to_run >= 0:
-        if cmd_ix_to_run < 0 or cmd_ix_to_run >= len(cmds):
-            raise IndexError(f"cmd_ix_to_run {cmd_ix_to_run} out of range (0–{len(cmds)-1})")
-        logging.info(f"Running only command index {cmd_ix_to_run}")
-        cmds = [cmds[cmd_ix_to_run]]
-
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(run_cmd, cmd): cmd for cmd in cmds}
+    with concurrent.futures.ProcessPoolExecutor(max_workers=cfg.max_workers) as executor:
+        futures = {executor.submit(run_cmd, cmd, cfg): cmd for cmd in cmds}
 
         pending = len(futures)
-        finished = 0
-        errors = 0
+        finished = errors = 0
 
         for future in concurrent.futures.as_completed(futures):
             cmd = futures[future]
             try:
-                result = future.result()  # You can capture the result if needed
+                future.result()
                 finished += 1
             except Exception:
                 logging.exception("Error running command %s", cmd)
                 errors += 1
-
             pending -= 1
-            logging.info(f"Pending: {pending}, Finished: {finished}, Errors: {errors}")
-
-            if errors > max_errors:
-                raise Exception(f"There are more errors than max_errors, errors {errors}")
-
+            logging.info("Pending: %d, Finished: %d, Errors: %d", pending, finished, errors)
+            if errors > cfg.max_errors:
+                raise Exception(f"More errors than max_errors: {errors} > {cfg.max_errors}")
 
 def setup_logging(level=logging.INFO):
     logging.basicConfig(
-        format='%(asctime)s %(levelname)-8s %(message)s',
+        format='%(asctime)s %(levelname)-8s [%(module)s:%(lineno)d] %(message)s',
         datefmt='%y-%m-%d %H:%M:%S',
-        level=level,
+        level=logging.INFO,
     )
 
-
-def testrun1(cfg: Optional[RunnerConfig] = None) -> RunnerConfig:
+def testrun1(cfg: Optional[RunnerConfig] = None):
 
     setup_logging(level=logging.DEBUG)
     if cfg is None:
       cfg = RunnerConfig()
 
     sync_input_dir(f"{cfg.stage_root_dir}{cfg.input_dir}", f"/share{cfg.input_dir}")
+    stage_images_from_file_list(cfg, f'{cfg.input_dir}/stage_images_all.txt')
 
-def testrunStage(cfg: Optional[RunnerConfig] = None) -> RunnerConfig:
+def test_run_all(cfg: Optional[RunnerConfig] = None):
+
+    setup_logging(level=logging.DEBUG)
+    if cfg is None:
+        cfg = RunnerConfig()
+
+    run_pipeline(cfg)
+
+def test_print_debug():
+
+    setup_logging(level=logging.DEBUG)
+
+    # --- log interpreter details ---
+    logging.info("Python %s  (executable: %s)",
+    platform.python_version(), sys.executable)
+
+    try:
+        result = subprocess.run(
+            ["ssh", "-G", "guestserver"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        logging.info("Effective SSH config for guestserver")
+        logging.info(result.stdout)
+    except subprocess.CalledProcessError as e:
+        print("Error running ssh -G:", e.stderr)
+
+
+def testrun_stage(cfg: Optional[RunnerConfig] = None):
 
     setup_logging(level=logging.DEBUG)
     if cfg is None:
       cfg = RunnerConfig()
 
-    stage_images_from_file_list(f'{cfg.input_dir}/stage_images.txt',
-                                   cfg.stage_root_dir,
-                                   s3_bucket=cfg.s3_bucket)
+    stage_images_from_file_list(cfg, f'{cfg.input_dir}/stage_images.txt')
 
 def run_pipeline(cfg: RunnerConfig) -> None:
 
@@ -414,10 +508,10 @@ def run_pipeline(cfg: RunnerConfig) -> None:
         sync_pipelines_dir(f"{cfg.pipelines_dir}", f"/share{cfg.pipelines_dir}")
 
         # stage images
-        stage_images_from_file_list(f'{cfg.input_dir}/stage_images.txt',)
+        stage_images_from_file_list(cfg, f'{cfg.input_dir}/stage_images.txt',)
 
         # execute all commands with a threadpool
-        run_all_commands_via_threadpool(cmd_file, cfg.max_workers, cfg.max_errors, cfg.cmd_ix_to_run)
+        run_all_commands_via_threadpool(cfg, cmd_file)
 
         # merge all csv into parquet files
         converter = CSVToParquetConverter(input_path=cfg.output_dir,
