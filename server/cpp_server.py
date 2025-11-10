@@ -569,7 +569,7 @@ def init_new_db(cpp_config=None):
         user=db_cfg['user'],
         host=db_cfg['host'],
         port=db_cfg['port'],
-        password=db_cfg.get('password')
+        password=db_cfg.get('password'),
     )
 
 def move_job_results_to_storage(analysis: Analysis, job_list: List[Dict[str, Any]]) -> List[str]:

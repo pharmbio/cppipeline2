@@ -2,7 +2,6 @@ import logging
 import os
 import threading
 import time
-from dotenv import load_dotenv
 from database import Database
 from database import Analysis
 import hpc_utils
@@ -21,8 +20,7 @@ def test_input_dir_synch():
     assert analysis is not None, "analysis missing"
     sync_manager.sync_input_dir(analysis.sub_id)
 
-# Load the environment variables from the .env file
-load_dotenv()
+# .env is loaded centrally in config.py via python-dotenv
 
 cpp_server.setup_logging(logging.INFO)
 cpp_server.init_new_db()
@@ -166,5 +164,4 @@ Traceback (most recent call last):
 
 
 #test_send_slack_error_message()
-
 

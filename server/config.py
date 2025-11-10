@@ -2,8 +2,12 @@
 import yaml
 import os
 import logging
+from dotenv import load_dotenv
 from dataclasses import dataclass
 from typing import Dict, Any
+
+# Load environment variables early so CONFIG sees values from .env in dev
+load_dotenv()
 
 @dataclass(frozen=True)
 class Config:
