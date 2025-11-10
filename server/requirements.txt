@@ -1,0 +1,5 @@
+psycopg2-binary==2.9.11
+kubernetes==34.1.0
+pandas==2.2
+pyarrow==17
+python-dotenv
