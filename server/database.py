@@ -1,6 +1,7 @@
 from __future__ import annotations
 import logging
 import json
+import error_utils
 from typing import List, Optional, Dict, Any
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
@@ -89,26 +90,22 @@ class Image:
 # ImageSet Class
 # -----------------------------------------------------------------------------
 class ImageSet:
-    def __init__(self, imgset_id: str) -> None:
-        """Initialize the ImageSet with a unique identifier and an empty list of images."""
-        self.imgset_id = imgset_id
-        self.images: List[Image] = []
+    def __init__(self, set_id: str):
+        self.id = set_id
+        self._imgs: List[Image] = []
 
-    def add_image(self, image: Image) -> None:
-        """Add an Image to this ImageSet."""
-        self.images.append(image)
+    def add_image(self, img: Image):
+        self._imgs.append(img)
 
     def __iter__(self):
-        """Iteration over the images in this ImageSet."""
-        return iter(self.images)
+        return iter(self._imgs)
 
     @property
     def all_images(self) -> List[Image]:
-        """Return the list of Image objects in this ImageSet."""
-        return self.images
+        return self._imgs
 
-    def __repr__(self) -> str:
-        return f"<ImageSet id={self.imgset_id}, count={len(self.images)}>"
+    def __repr__(self):
+        return f"<ImageSet {self.id} n={len(self._imgs)}>"
 
 # -----------------------------------------------------------------------------
 # Database Class
@@ -201,10 +198,10 @@ class Database:
                 logging.info('Executing query: %s with ID: %s', query.strip(), acq_id)
                 cursor.execute(query, (acq_id,))
                 results = cursor.fetchall()
-                
+
                 # Create a list of unique z values
                 z_values = [row['z'] for row in results]
-                
+
                 if z_values:
                     # Determine the middle index (using lower middle for even counts)
                     middle_index = (len(z_values) - 1) // 2
@@ -213,7 +210,7 @@ class Database:
                 else:
                     logging.warning('No distinct z values found for plate acquisition ID: %s', acq_id)
                     return None
-                
+
         except Exception as e:
             logging.error(f"Error fetching first z plane: {e}")
             return None
@@ -266,27 +263,25 @@ class Database:
             if conn:
                 self.release_connection(conn)
 
-    def get_channelmap(self, plate_acquisition_id: Any) -> List[Dict[str, Any]]:
-        """
-        Fetch channel map rows for the given plate acquisition.
-        """
-        conn = self.get_connection()
+    def get_channelmap(self, acq_id: int) -> List[Dict[str, Any]]:
+        conn = None
         try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                query = (
-                    "SELECT * "
-                    "FROM channel_map "
-                    "WHERE map_id = ("
-                    "   SELECT channel_map_id FROM plate_acquisition WHERE id = %s"
-                    ")"
+            conn = self.get_connection()
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM channel_map "
+                    " WHERE map_id = (SELECT channel_map_id "
+                    "                   FROM plate_acquisition "
+                    "                  WHERE id = %s)",
+                    (acq_id,),
                 )
-                cursor.execute(query, (plate_acquisition_id,))
-                return cursor.fetchall()
+                return cur.fetchall()
         except Exception as e:
-            logging.error(f"Error fetching channel map from DB: {e}")
+            logging.error("get_channelmap: %s", e)
             return []
         finally:
-            self.release_connection(conn)
+            if conn:
+                self.release_connection(conn)
 
     def get_new_analyses(self) -> List[Analysis]:
         logging.info('Fetching new analyses')
@@ -314,7 +309,7 @@ class Database:
         return analyses
 
     def get_analysis(self, sub_id: int) -> Optional[Analysis]:
-        logging.info('Fetching analysis for sub_id')
+        logging.info(f'Fetching analysis for sub_id {sub_id}')
         query = (
             "SELECT * "
             "FROM image_sub_analyses_v1 "
@@ -337,34 +332,177 @@ class Database:
                 self.release_connection(conn)
         return analysis_obj
 
-    def set_sub_analysis_error(self, analysis: Analysis, errormessage: str):
-        logging.error(f"TODO implement set sub analysis error, errormessage: {errormessage}")
+    def set_sub_analysis_error(self, analysis: 'Analysis', errormessage: str) -> None:
+        """
+        Mark the given sub-analysis as errored and persist a brief error message.
 
-    def update_progress_meta(self, analysis_id, sub_analysis_id, data_key, data_value):
-        sub_analysis_data = json.dumps({data_key: data_value})
-        analysis_data = json.dumps({f"{data_key}_{sub_analysis_id}": data_value})
+        - Sets image_sub_analyses.error = NOW()
+        - Merges {"error_message": errormessage} into image_sub_analyses.result JSONB
+        - Also records a parent-scoped status key to help UIs surface the error
+        """
         conn = None
         try:
             conn = self.get_connection()
             with conn.cursor() as cursor:
-                query_sub = (
-                    "UPDATE image_sub_analyses "
-                    "SET progress = progress || %s "
-                    "WHERE sub_id = %s"
+                # Update sub-analysis error timestamp and attach message into result
+                result_patch = json.dumps({"error_message": str(errormessage)[:500]})
+                cursor.execute(
+                    """
+                    UPDATE image_sub_analyses
+                       SET error = NOW(),
+                           result = COALESCE(result, '{}'::jsonb) || %s::jsonb
+                     WHERE sub_id = %s
+                    """,
+                    [result_patch, analysis.sub_id],
                 )
-                cursor.execute(query_sub, [sub_analysis_data, sub_analysis_id])
-                query_analysis = (
-                    "UPDATE image_sub_analyses "
-                    "SET progress = progress || %s "
-                    "WHERE id = %s"
+
+                # Also reflect error details in the sub's status JSONB
+                sub_status_patch = json.dumps({
+                    "state": "ERROR",
+                    "error_message": str(errormessage)[:200]
+                })
+                cursor.execute(
+                    """
+                    UPDATE image_sub_analyses
+                       SET status = COALESCE(status, '{}'::jsonb) || %s::jsonb
+                     WHERE sub_id = %s
+                    """,
+                    [sub_status_patch, analysis.sub_id],
                 )
-                cursor.execute(query_analysis, [analysis_data, analysis_id])
+
+                # Record a succinct error status on the parent as well (include message)
+                parent_status = json.dumps({f"error_{analysis.sub_id}": str(errormessage)[:200]})
+                cursor.execute(
+                    """
+                    UPDATE image_analyses
+                       SET status = COALESCE(status, '{}'::jsonb) || %s::jsonb
+                     WHERE id = %s
+                    """,
+                    [parent_status, analysis.id],
+                )
                 conn.commit()
         except Exception as e:
-            logging.error(f"Error updating progress: {e}")
+            logging.error(
+                "set_sub_analysis_error failed; sub_id=%s analysis_id=%s",
+                analysis.sub_id,
+                analysis.id,
+                exc_info=True,
+            )
+            if conn:
+                conn.rollback()
         finally:
             if conn:
                 self.release_connection(conn)
+
+    def set_analysis_error(self, analysis_id: int, errormessage: str) -> None:
+        """
+        Mark a parent analysis as errored and persist a brief error message.
+
+        - Sets image_analyses.error = NOW()
+        - Merges {"error_message": <msg>} into image_analyses.result JSONB
+        """
+        conn = None
+        try:
+            conn = self.get_connection()
+            with conn.cursor() as cursor:
+                result_patch = json.dumps({"error_message": str(errormessage)[:500]})
+                cursor.execute(
+                    """
+                    UPDATE image_analyses
+                       SET error = NOW(),
+                           result = COALESCE(result, '{}'::jsonb) || %s::jsonb
+                     WHERE id = %s
+                    """,
+                    [result_patch, analysis_id],
+                )
+                # Also reflect the error in the parent's status JSONB
+                parent_status_patch = json.dumps({
+                    "state": "ERROR",
+                    "error_message": str(errormessage)[:200]
+                })
+                cursor.execute(
+                    """
+                    UPDATE image_analyses
+                       SET status = COALESCE(status, '{}'::jsonb) || %s::jsonb
+                     WHERE id = %s
+                    """,
+                    [parent_status_patch, analysis_id],
+                )
+                conn.commit()
+        except Exception as e:
+            logging.error("set_analysis_error failed; analysis_id=%s", analysis_id, exc_info=True)
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                self.release_connection(conn)
+
+    def set_status(self, analysis_id: int, sub_analysis_id: int, data_key: str, data_value: str):
+        """
+        Merge a single key/value into the JSONB `status` column
+        of both image_sub_analyses and image_analyses.
+        """
+        conn = None
+        try:
+            conn = self.get_connection()
+            with conn.cursor() as cursor:
+                logging.debug(f"Updating status[{data_key}]={data_value} for sub_id={sub_analysis_id}")
+
+                # Prepare JSON strings manually
+                sub_data = json.dumps({data_key: data_value})
+                parent_data = json.dumps({f"{data_key}_{sub_analysis_id}": data_value})
+
+                # Merge into image_sub_analyses.status
+                sub_q = """
+                UPDATE image_sub_analyses
+                    SET status = COALESCE(status, '{}'::jsonb) || %s::jsonb
+                WHERE sub_id = %s
+                """
+                cursor.execute(sub_q, [sub_data, sub_analysis_id])
+
+                # Merge into image_analyses.status
+                parent_q = """
+                UPDATE image_analyses
+                    SET status = COALESCE(status, '{}'::jsonb) || %s::jsonb
+                WHERE id = %s
+                """
+                cursor.execute(parent_q, [parent_data, analysis_id])
+
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Error updating status: {e}")
+            if conn: conn.rollback()
+        finally:
+            if conn:
+                self.release_connection(conn)
+
+
+    # ---------- started-timestamp helpers ---------------------------------
+    def timestamp_analysis_started(self, analysis_id: int):
+        self._stamp_started("image_analyses", "id", analysis_id)
+
+    def timestamp_sub_analysis_started(self, sub_analysis_id: int):
+        self._stamp_started("image_sub_analyses", "sub_id", sub_analysis_id)
+
+    def _stamp_started(self, table: str, key: str, value: int):
+        conn = None
+        try:
+            conn = self.get_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {table} "
+                    "   SET start = COALESCE(start, now()) "
+                    f" WHERE {key} = %s",
+                    (value,),
+                )
+                conn.commit()
+        except Exception as e:
+            logging.error("mark_%s_started: %s", table, e)
+            if conn: conn.rollback()
+        finally:
+            if conn:
+                self.release_connection(conn)
+
 
 # -----------------------------------------------------------------------------
 # Analysis Class
@@ -373,7 +511,22 @@ class Analysis:
     def __init__(self, data: Dict[str, Any]) -> None:
         """Initialize the Analysis with a dictionary of analysis data."""
         self._data = data
-        self._cached_channelmap: Optional[List[Dict[str, Any]]] = None
+        # Cache for channel map, keyed by channel (int) with dye name (str)
+        self._cached_channelmap: Optional[Dict[int, str]] = None
+        # Soft validation flags to allow early guards without raising
+        self.is_valid: bool = True
+        self.invalid_reason: Optional[str] = None
+        try:
+            meta = self._data.get('meta', {}) or {}
+            # Guard required fields for CellProfiler analyses
+            if meta.get('type') == 'cellprofiler':
+                if not self._data.get('plate_acquisition_id'):
+                    self.is_valid = False
+                    self.invalid_reason = "Missing or wrong plate_acquisition_id"
+        except Exception as _e:
+            # If validation itself fails, mark invalid with generic reason
+            self.is_valid = False
+            self.invalid_reason = "Invalid analysis metadata"
 
     @property
     def finished(self) -> bool:
@@ -397,16 +550,21 @@ class Analysis:
         return meta_info.get('type') == 'cellprofiler'
 
     @property
-    def sub_type(self) -> bool:
-        return self._data.get('meta', {}).get('sub_type', "undefined_sub_type")
+    def sub_type(self) -> str:
+        """Return the sub-analysis type (e.g., 'icf', 'feat')."""
+        val = self._data.get('meta', {}).get('sub_type', "undefined_sub_type")
+        return str(val)
 
     @property
-    def is_run_on_dardel(self) -> bool:
-        return self._data.get('meta', {}).get('run_on_dardel', False)
+    def run_location(self) -> Optional[str]:
+        """
+        Target run location/cluster key.
 
-    @property
-    def is_run_on_hpcdev(self) -> bool:
-        return self._data.get('meta', {}).get('run_on_hpcdev', False)
+        Expected values (string): 'pelle', 'uppmax', 'hpc_dev', 'farmbio', etc.
+        Returns None if not present.
+        """
+        loc = self._data.get('meta', {}).get('run_location')
+        return str(loc) if isinstance(loc, str) and loc else None
 
     @property
     def id(self) -> Any:
@@ -439,8 +597,9 @@ class Analysis:
         return self._data.get("plate_barcode")
 
     @property
-    def use_icf(self) -> Optional[bool]:
-        return self._data.get("use_icf", False)
+    def use_icf(self) -> bool:
+        analysis_meta = self.meta
+        return bool(analysis_meta.get('use_icf', False))
 
     @property
     def priority(self) -> Optional[int]:
@@ -451,17 +610,18 @@ class Analysis:
             return 0
 
     @property
-    def job_timeout(self) -> Optional[str]:
-        return self._data.get("job_timeout", "10800")
+    def job_timeout(self) -> int:
+        """Return job timeout as integer seconds.
 
-    def update_progress_meta(self, data_key, data_value):
-        analysis_id = self._data.get('analysis_id')
-        sub_id = self._data.get('sub_id')
-        if analysis_id is not None and sub_id is not None:
-            db = Database.get_instance()
-            db.update_progress_meta(analysis_id, sub_id, data_key, data_value)
-        else:
-            logging.error("Missing analysis_id or sub_id for metadata update.")
+        Accepts int or string in the underlying data; defaults to 10800 on
+        absence or parse failure.
+        """
+        val = self._data.get("job_timeout", 10800)
+        try:
+            return int(val)
+        except Exception:
+            logging.warning(f"Invalid job_timeout '{val}', defaulting to 10800")
+            return 10800
 
     def all_dependencies_satisfied(self) -> bool:
         db = Database.get_instance()
@@ -488,6 +648,32 @@ class Analysis:
             return list(analysis_meta['channels'])
         return None
 
+    @property
+    def estimated_job_time(self) -> Optional[str]:
+        """
+        Optional per-sub-analysis estimated job time override from meta.
+        Expected as string in H:MM:SS format (e.g., "0:10:00").
+        Returns None if not provided.
+        """
+        analysis_meta = self.meta
+        if isinstance(analysis_meta, dict) and 'estimated_job_time' in analysis_meta:
+            val = analysis_meta.get('estimated_job_time')
+            return str(val) if val is not None else None
+        return None
+
+    @property
+    def estimated_job_mem(self) -> Optional[str]:
+        """
+        Optional per-sub-analysis estimated memory per job override from meta.
+        Expected as a string with units like "5GB" or numeric GB.
+        Returns None if not provided.
+        """
+        analysis_meta = self.meta
+        if isinstance(analysis_meta, dict) and 'estimated_job_mem' in analysis_meta:
+            val = analysis_meta.get('estimated_job_mem')
+            return str(val) if val is not None else None
+        return None
+
     def z_filter(self) -> List[Any]:
         """
         Return a list of z values from the metadata if available;
@@ -499,7 +685,7 @@ class Analysis:
             return parse_string_of_num_and_ranges(analysis_meta['z'])
         else:
             if not self.plate_acquisition_id:
-                logging.error("Missing plate_acquisition_id in analysis data")
+                logging.error("Missing or wrong plate_acquisition_id in analysis data")
                 return []
             db = Database.get_instance()
             z_val = db.get_middle_z_plane(self.plate_acquisition_id)
@@ -539,7 +725,7 @@ class Analysis:
                 img_sets[imgset_id] = ImageSet(imgset_id)
             img_sets[imgset_id].add_image(img)
         for set_id, img_set in img_sets.items():
-            logging.info(f"ImageSet {set_id} has {len(img_set.all_images)} images")
+            logging.debug(f"ImageSet {set_id} has {len(img_set.all_images)} images")
         return img_sets
 
     def get_imgset_batches(self, batch_size: Optional[int] = None) -> List[List[ImageSet]]:
@@ -583,7 +769,6 @@ class Analysis:
         self._cached_channelmap = result_dict
         return result_dict
 
-
     @property
     def storage_paths(self) -> Dict[str, Any]:
         """
@@ -605,17 +790,29 @@ class Analysis:
         return self.meta.get('cp_version')
 
     @property
-    def pipeline_file(self) -> Optional[str]:
+    def pipeline_file(self) -> str:
         """
         Return the full path to the pipeline file.
-        If a pipeline file is specified in the metadata, prepend '/cpp_work/pipelines/' to it.
+        If not specified in metadata, raise a ValueError.
         """
         pipeline = self.meta.get('pipeline_file')
-        if pipeline:
-            return '/cpp_work/pipelines/' + pipeline
-        return None
+        if not pipeline:
+            raise ValueError("Missing required 'pipeline_file' in analysis meta")
+        return '/cpp_work/pipelines/' + pipeline
 
-# -----------------------------------------------------------------------------
+    def timestamp_started(self):
+        db = Database.get_instance()
+        db.timestamp_analysis_started(self.id)
+        db.timestamp_sub_analysis_started(self.sub_id)
+
+    def add_status_jobid(self, jobid: str):
+        """
+        Add the given jobid into the status JSONB field
+        for both image_sub_analyses and image_analyses.
+        """
+        db = Database.get_instance()
+        db.set_status(self.id, self.sub_id, "jobid", jobid)
+
 # Example Usage
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
