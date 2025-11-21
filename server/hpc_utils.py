@@ -59,23 +59,23 @@ def build_ssh_cmd_sbatch_hpc(analysis: Analysis, run_location: str):
     if run_location == 'rackham':
         return build_ssh_cmd_sbatch_rackham(analysis)
     elif run_location == 'pelle':
-        return build_ssh_cmd_sbatch_pelle(analysis)
+        return build_ssh_cmd_sbatch_hpc(analysis, 'pelle')
     elif run_location == 'hpc_dev':
-        return build_ssh_cmd_sbatch_pelle(analysis)
+        return build_ssh_cmd_sbatch_hpc(analysis, 'hpc_dev')
     elif run_location == 'uppmax':
-        return build_ssh_cmd_sbatch_pelle(analysis)
+        return build_ssh_cmd_sbatch_hpc(analysis, 'pelle')
     elif run_location == 'farmbio':
         raise NotImplementedError("run_location 'farmbio' mapping not implemented in build_ssh_cmd_sbatch_hpc")
     else:
         raise ValueError(f"No valid run location in build_ssh_cmd_sbatch_hpc, run_loc={run_location}")
 
-def build_ssh_cmd_sbatch_pelle(analysis: Analysis):
+def build_ssh_cmd_sbatch_hpc(analysis: Analysis, cluster_name: str):
 
-    logging.info(f"Inside build_ssh_cmd_sbatch_pelle: {analysis.sub_id}, sub_type {analysis.sub_type}")
+    logging.info(f"Inside build_ssh_cmd_sbatch_hpc: {cluster_name}, id {analysis.sub_id}, sub_type {analysis.sub_type}")
 
-    cluster_cfg = CONFIG.cluster.get('pelle')
+    cluster_cfg = CONFIG.cluster.get(cluster_name)
     if not cluster_cfg:
-        raise Exception("cluster config is None for pelle")
+        raise Exception(f"cluster config is None for cluster {cluster_name}")
     resources = cluster_cfg['resources']
     user = cluster_cfg['user']
     hostname = cluster_cfg['hostname']
@@ -161,7 +161,7 @@ def build_ssh_cmd_sbatch_pelle(analysis: Analysis):
     except Exception:
         logging.error("Ignoring invalid meta.estimated_job_mem override: %s", analysis.estimated_job_mem)
 
-    dyn = calculate_pelle_resources(
+    dyn = calculate_hpc_resources(
         n_jobs=n_jobs,
         workers_cfg=workers_cfg,
         minutes_per_wave=minutes_per_wave,
@@ -222,8 +222,8 @@ def _fmt_minutes_hms(minutes: int) -> str:
     return f"{hours:02d}:{mins:02d}:00"
 
 
-def calculate_pelle_resources(n_jobs: int, workers_cfg: int, minutes_per_wave: int = 60, mem_per_job_gb: int | None = None) -> dict:
-    """Calculate dynamic resources for Pelle.
+def calculate_hpc_resources(n_jobs: int, workers_cfg: int, minutes_per_wave: int = 60, mem_per_job_gb: int | None = None) -> dict:
+    """Calculate dynamic resources for HPC jobs (e.g. Pelle).
 
     - workers: min(workers_cfg, max(1, n_jobs))
     - waves: ceil(n_jobs / workers)
@@ -232,9 +232,9 @@ def calculate_pelle_resources(n_jobs: int, workers_cfg: int, minutes_per_wave: i
     - mem_gb: dynamic memory recommendation (10GB per concurrent job/worker)
     """
     if workers_cfg is None or workers_cfg <= 0:
-        raise ValueError(f"calculate_pelle_resources: workers_cfg must be > 0, got {workers_cfg}")
+        raise ValueError(f"calculate_hpc_resources: workers_cfg must be > 0, got {workers_cfg}")
     if n_jobs is None or n_jobs <= 0:
-        raise ValueError(f"calculate_pelle_resources: n_jobs must be > 0, got {n_jobs}")
+        raise ValueError(f"calculate_hpc_resources: n_jobs must be > 0, got {n_jobs}")
 
     workers = max(1, min(workers_cfg, int(n_jobs)))
     waves = max(1, math.ceil(n_jobs / workers))

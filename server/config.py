@@ -16,16 +16,25 @@ class Config:
     slack_webhook_url: str
 
 def is_debug() -> bool:
-    # Replace with your actual debug logic.
+    """
+    Determine debug mode from the DEBUG env var.
+
+    Truthy: 1, true, yes, on
+    Falsy: 0, false, no, off, empty/missing
+    """
+    val = os.environ.get('DEBUG')
+    if val is None:
+        return False
+    v = str(val).strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off", ""):
+        return False
     return True
 
 def load_config() -> Config:
-    if is_debug():
-        config_file = 'debug_configs.yaml'
-    else:
-        logging.error("Only debug profile for now, exiting")
-        exit(1)
-
+    # Allow override of config path via env; default to debug_configs.yaml
+    config_file = os.getenv('CPP_CONFIG_FILE', 'debug_configs.yaml')
     with open(config_file, 'r') as f:
         config_data = yaml.load(f, Loader=yaml.FullLoader)
 

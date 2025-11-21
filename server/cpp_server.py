@@ -188,18 +188,24 @@ def make_imgset_csv(imgsets: Any,
     content = "\n".join(content_lines) + "\n"
     return header + content
 
-def is_debug():
+def is_debug() -> bool:
     """
-    Check if the users has the debug env.var. set
+    Determine debug mode from the DEBUG env var.
+
+    Truthy values: 1, true, yes, on (case-insensitive)
+    Falsy values: 0, false, no, off, empty/missing
     """
-    debug = False
-    if os.environ.get('DEBUG'):
-        debug = True
+    val = os.environ.get('DEBUG')
+    if val is None:
+        return False
+    v = str(val).strip().lower()
+    if v in ("1", "true", "yes", "on"):  # enable
+        return True
+    if v in ("0", "false", "no", "off", ""):
+        return False
+    # Fallback: any other non-empty value counts as true
+    return True
 
-    return debug
-
-
-## Legacy load_cpp_config removed in favor of centralized config.CONFIG
 
 
 def generate_random_identifier(length):
@@ -546,10 +552,6 @@ def _log_level_from_env(default_level: int = logging.INFO) -> int:
             "FATAL": logging.CRITICAL,
         }
         return mapping.get(name, default_level)
-
-    if is_debug():
-        return logging.DEBUG
-
     return default_level
 
 def init_new_db(cpp_config=None):
@@ -917,12 +919,6 @@ def run_server_loop_continously(sleep_seconds: int = 10) -> None:
         logging.info(f"Sleeping for {sleep_seconds} sec")
         time.sleep(sleep_seconds)
 
-
-def run_server_loop(sleep_seconds: int = 20) -> None:
-    """Compatibility alias for Java-esque naming: runs the continuous server loop."""
-    return run_server_loop_continously(sleep_seconds)
-
-
 def main():
     # Determine log level via env, falling back to DEBUG when DEBUG=1 is set
     # and INFO otherwise.
@@ -934,7 +930,7 @@ def main():
 
     # Start continuous loop; callers may import and call run_server_processing() directly.
     try:
-        run_server_loop_continously(sleep_seconds=20)
+        run_server_loop_continously(sleep_seconds=10)
     except KeyboardInterrupt:
         logging.info("cpp_server interrupted by user (Ctrl+C)")
     except Exception as e:

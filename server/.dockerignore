@@ -23,3 +23,13 @@ htmlcov/
 docker-compose.override.yml
 *.env
 .env*
+debug_configs.yaml
+k8s/
+*.pem
+*.key
+id_rsa
+known_hosts
+id_ed25519
+id_ed25519.pub
+.ssh/
+server_method_test.py
