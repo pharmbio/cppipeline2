@@ -44,6 +44,35 @@ class RunnerConfig:
     s3_region: Optional[str] = os.environ.get("AWS_DEFAULT_REGION", None) # default not needed
 
 
+def send_slack_warning(message: str) -> None:
+    """
+    Stub for Slack notifications. Replace with real implementation later.
+    """
+    logging.warning("[slack warning stub] %s", message)
+
+
+def retry_operation(operation, description: str, max_duration_seconds: Optional[int] = 3600, sleep_seconds: int = 60):
+    """
+    Retry `operation` until it succeeds or the max duration elapses.
+    Sends a Slack warning through the stub for each failure.
+    """
+    deadline = None if max_duration_seconds is None else time.time() + max_duration_seconds
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            return operation()
+        except Exception as exc:
+            logging.exception("%s failed (attempt %d)", description, attempt)
+            send_slack_warning(
+                f"{description} failed on attempt {attempt}: {exc}. Retrying in {sleep_seconds} seconds."
+            )
+            if deadline is not None and time.time() >= deadline:
+                raise RuntimeError(f"{description} failed after {attempt} attempts and exceeded retry window") from exc
+            time.sleep(sleep_seconds)
+
+
 class CSVToParquetConverter:
     def __init__(self, input_path, output_path, chunk_size=10000):
         self.input_path = input_path
@@ -163,7 +192,7 @@ def _run_rsync(src: str, dst: str, relative: bool = False, excludes: Optional[Li
         for pat in excludes:
             cmd.append(f"--exclude={pat}")
     cmd += [src, dst]
-    logging.debug("Rsync command: %s", cmd)
+    logging.info("Rsync command: %s", cmd)
     subprocess.run(cmd, check=True)
 
 def sync_input_dir(local: str, remote: str) -> None:
@@ -297,6 +326,7 @@ def stage_images_via_s3_files_list(cfg: RunnerConfig, stage_images_file: str) ->
     # Build the wrapper here (safer for multiprocessing)
     client_wrapper = _make_s3_wrapper(cfg)
     s3 = client_wrapper.get_fresh_s3_client()
+    assert s3 is not None
 
     xfer_cfg = TransferConfig(num_download_attempts=1, max_concurrency=1)
 
@@ -614,12 +644,14 @@ def run_pipeline(cfg: RunnerConfig) -> None:
         start_time = time.time()
 
         cmd_file = f"{cfg.input_dir}/cmds.txt"
+         
+        retry_operation(
+            sync_pipelines_dir(f"{cfg.pipelines_dir}", f"/share{cfg.pipelines_dir}"), "Sync pipelines dirs", max_duration_seconds=3600
+        )
 
-        # sync input dir
-        sync_input_dir(f"{cfg.input_dir}", f"/share{cfg.input_dir}")
-
-        # sync pipelines dir
-        sync_pipelines_dir(f"{cfg.pipelines_dir}", f"/share{cfg.pipelines_dir}")
+        retry_operation(
+            sync_input_dir(f"{cfg.input_dir}", f"/share{cfg.input_dir}"), "Sync input dirs", max_duration_seconds=3600
+        )
 
         # stage images
         # stage is done per thread
@@ -654,12 +686,10 @@ def run_pipeline(cfg: RunnerConfig) -> None:
 
     finally:
         if cfg.output_dir:
-            try:
-                logging.info("finally sync output dir including parquet files")
-                set_permissions_recursive(cfg.output_dir, 0o777)
-                sync_analysis_output_dir_to_remote(cfg.output_dir)
-            except Exception:
-                logging.exception("Failed to sync output dir during final cleanup")
+            set_permissions_recursive(cfg.output_dir, 0o777)
+            retry_operation(
+                sync_analysis_output_dir_to_remote(cfg.output_dir), description="Final output sync", max_duration_seconds=None,
+            )
 
         while active_processes:
             proc = active_processes.pop()
