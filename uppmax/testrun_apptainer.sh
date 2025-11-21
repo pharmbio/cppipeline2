@@ -11,7 +11,7 @@ ID=15480 # full_qc=15164 #"15118" # "13744" 27feat=15171 15253/254 feat 15308=4.
   -e 1 \
   -V "v4.2.8-cellpose4.0.7" \
   -c "PYTHONPATH=/cpp python3 -c 'import cp_uppmax_runner as r; r.${CMD}'" \
-  -s
+# -s
 
 #      -c "PYTHONPATH=/cpp python3 -c 'import cp_uppmax_runner as r; r.testrun_stage()'"
 #      -c "PYTHONPATH=/cpp python3 -c 'import cp_uppmax_runner as r; r.testrun_stage()'"

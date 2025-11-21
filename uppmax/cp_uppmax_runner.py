@@ -582,6 +582,11 @@ def setup_logging(level=logging.INFO, log_path: Optional[str] = None):
 
     logging.basicConfig(level=level, handlers=handlers)
 
+    # Keep boto-/urllib3-level chatter quiet even when our app is in DEBUG
+    if level <= logging.DEBUG:
+        for noisy_lib in ("boto3", "botocore", "s3transfer", "urllib3"):
+            logging.getLogger(noisy_lib).setLevel(logging.INFO)
+
 def testrun1(**overrides):
     setup_logging(level=logging.INFO)
 
@@ -640,17 +645,23 @@ def test_run_sync_analysis_output_dir_to_remote(**overrides):
 
 def run_pipeline(cfg: RunnerConfig) -> None:
 
+    logging.info("inside run_pipeline()")
+
     try:
         start_time = time.time()
 
         cmd_file = f"{cfg.input_dir}/cmds.txt"
          
         retry_operation(
-            sync_pipelines_dir(f"{cfg.pipelines_dir}", f"/share{cfg.pipelines_dir}"), "Sync pipelines dirs", max_duration_seconds=3600
+            lambda: sync_pipelines_dir(f"{cfg.pipelines_dir}", f"/share{cfg.pipelines_dir}"),
+            "Sync pipelines dirs",
+            max_duration_seconds=3600,
         )
 
         retry_operation(
-            sync_input_dir(f"{cfg.input_dir}", f"/share{cfg.input_dir}"), "Sync input dirs", max_duration_seconds=3600
+            lambda: sync_input_dir(f"{cfg.input_dir}", f"/share{cfg.input_dir}"),
+            "Sync input dirs",
+            max_duration_seconds=3600,
         )
 
         # stage images
@@ -688,7 +699,9 @@ def run_pipeline(cfg: RunnerConfig) -> None:
         if cfg.output_dir:
             set_permissions_recursive(cfg.output_dir, 0o777)
             retry_operation(
-                sync_analysis_output_dir_to_remote(cfg.output_dir), description="Final output sync", max_duration_seconds=None,
+                lambda: sync_analysis_output_dir_to_remote(cfg.output_dir),
+                description="Final output sync",
+                max_duration_seconds=None,
             )
 
         while active_processes:
