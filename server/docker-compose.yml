@@ -1,0 +1,32 @@
+version: "2.4"
+
+services:
+  cpp-master:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: cppserver2
+    restart: always
+    network_mode: host
+    user: "20000:20000"
+
+    environment:
+      DEBUG: ${DEBUG}
+      DB_PASS: ${DB_PASS}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
+      HPC_CLUSTER: ${HPC_CLUSTER}
+
+    volumes:
+      - ./debug_configs.yaml:/cpp/debug_configs.yaml:ro
+      - /home/cpp-worker/.ssh:/home/cpp/.ssh:ro
+      - /share/data2/cellprofiler/automation:/cpp_work
+
+    working_dir: /cpp
+    command: python3 /cpp/cpp_server.py
+
+    logging:
+      driver: local
+      options:
+        max-size: "50m"
+        max-file: "5"

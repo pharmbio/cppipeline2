@@ -207,6 +207,25 @@ def is_debug() -> bool:
     return True
 
 
+def get_hpc_cluster() -> str:
+    """
+    Resolve which HPC cluster/run_location to use.
+
+    Controlled via the HPC_CLUSTER env var, falling back to "pelle".
+    Accepted values include: pelle, hpc_dev, rackham, uppmax, farmbio.
+    """
+    default = "pelle"
+    env_val = os.environ.get("HPC_CLUSTER")
+    if not env_val:
+        return default
+
+    cluster = env_val.strip().lower()
+    allowed = {"pelle", "hpc_dev", "rackham", "uppmax", "farmbio"}
+    if cluster not in allowed:
+        logging.warning("Unknown HPC_CLUSTER '%s', falling back to %s", cluster, default)
+        return default
+    return cluster
+
 
 def generate_random_identifier(length):
     return ''.join(random.SystemRandom().choice(string.ascii_lowercase + string.digits) for _ in range(length))
@@ -864,13 +883,14 @@ def run_server_processing() -> None:
     sub-analyses, finalize them, and optionally attempt to finish parent analyses.
     """
     try:
-        CLUSTER = "pelle"
+        cluster = get_hpc_cluster()
+        logging.info("run_server_processing: using cluster=%s", cluster)
 
         # Submit or prepare new analyses for selected cluster
-        handle_new_analyses(CLUSTER)
+        handle_new_analyses(cluster)
 
         # Scan for finished sub-analyses (for selected cluster) and finalize them
-        finished_subs = fetch_finished_subanalyses_hpc(CLUSTER)
+        finished_subs = fetch_finished_subanalyses_hpc(cluster)
         for sub_id, job_list in finished_subs.items():
             if not job_list:
                 logging.warning(f"Finished sub-analysis '{sub_id}' has empty job list; skipping finalize.")
@@ -897,10 +917,10 @@ def run_server_processing() -> None:
                 continue
 
         # Optionally mark full analyses finished for the selected cluster
-        handle_finished_analyses(CLUSTER)
+        handle_finished_analyses(cluster)
 
         # Update database with hpc job status for the selected cluster
-        hpc_utils.update_hpc_job_status(CLUSTER)
+        hpc_utils.update_hpc_job_status(cluster)
 
     except (psycopg2.Error) as dberr:
         logging.exception(dberr)
