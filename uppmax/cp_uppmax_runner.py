@@ -74,7 +74,7 @@ def retry_operation(operation, description: str, max_duration_seconds: Optional[
 
 
 class CSVToParquetConverter:
-    def __init__(self, input_path, output_path, chunk_size=10000):
+    def __init__(self, input_path, output_path, chunk_size=100000):
         self.input_path = input_path
         self.output_path = output_path
         self.chunk_size = chunk_size
@@ -178,7 +178,14 @@ class CSVToParquetConverter:
 # ----------------------------------------------------------------------------
 # Sync Utilities
 # ----------------------------------------------------------------------------
-def _run_rsync(src: str, dst: str, relative: bool = False, excludes: Optional[List[str]] = None, mkdirs: bool = False) -> None:
+def _run_rsync(
+    src: str,
+    dst: str,
+    relative: bool = False,
+    excludes: Optional[List[str]] = None,
+    mkdirs: bool = False,
+    size_only: bool = False,
+) -> None:
     cmd = [
         "rsync", "-av",
         "--no-owner", "--no-group", "--no-perms",
@@ -188,6 +195,8 @@ def _run_rsync(src: str, dst: str, relative: bool = False, excludes: Optional[Li
         cmd += ["--mk-dirs"]
     if relative:
         cmd += ["--relative"]
+    if size_only:
+        cmd += ["--size-only"]
     if excludes:
         for pat in excludes:
             cmd.append(f"--exclude={pat}")
@@ -208,6 +217,7 @@ def sync_analysis_output_dir_to_remote(local: str) -> None:
         normalized_local,
         f"guestserver:/cpp_work/output/",
         excludes=["*.csv"],
+        size_only=True,
     )
 
 def sync_job_output_dir_to_remote(job_output_dir: str, analysis_output_dir: str) -> None:
