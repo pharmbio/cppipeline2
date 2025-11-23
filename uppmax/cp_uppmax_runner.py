@@ -185,6 +185,7 @@ def _run_rsync(
     excludes: Optional[List[str]] = None,
     mkdirs: bool = False,
     size_only: bool = False,
+    ignore_existing: bool = False,
 ) -> None:
     cmd = [
         "rsync", "-av",
@@ -197,6 +198,8 @@ def _run_rsync(
         cmd += ["--relative"]
     if size_only:
         cmd += ["--size-only"]
+    if ignore_existing:
+        cmd += ["--ignore-existing"]
     if excludes:
         for pat in excludes:
             cmd.append(f"--exclude={pat}")
@@ -216,8 +219,10 @@ def sync_analysis_output_dir_to_remote(local: str) -> None:
     _run_rsync(
         normalized_local,
         f"guestserver:/cpp_work/output/",
+        # Only skip CSVs here; allow images if they were missed in per-job syncs
         excludes=["*.csv"],
         size_only=True,
+        ignore_existing=True,  # if a prior job sync succeeded, don’t resend
     )
 
 def sync_job_output_dir_to_remote(job_output_dir: str, analysis_output_dir: str) -> None:
@@ -235,6 +240,7 @@ def sync_job_output_dir_to_remote(job_output_dir: str, analysis_output_dir: str)
         job_abs,
         f"{dest_path}/",
         excludes=["*.csv"],
+        size_only=True,
         mkdirs=False,
     )
 
