@@ -214,16 +214,19 @@ def get_hpc_cluster() -> str:
     Controlled via the HPC_CLUSTER env var, falling back to "pelle".
     Accepted values include: pelle, hpc_dev, rackham, uppmax, farmbio.
     """
-    default = "pelle"
     env_val = os.environ.get("HPC_CLUSTER")
     if not env_val:
-        return default
+        return "pelle"
 
     cluster = env_val.strip().lower()
     allowed = {"pelle", "hpc_dev", "rackham", "uppmax", "farmbio"}
     if cluster not in allowed:
-        logging.warning("Unknown HPC_CLUSTER '%s', falling back to %s", cluster, default)
-        return default
+        msg = (
+            f"Invalid HPC_CLUSTER '{cluster}'. "
+            f"Allowed values: {', '.join(sorted(allowed))}"
+        )
+        logging.error(msg)
+        raise ValueError(msg)
     return cluster
 
 
@@ -882,9 +885,10 @@ def run_server_processing() -> None:
     Execute a single server iteration: submit new analyses, pick up finished
     sub-analyses, finalize them, and optionally attempt to finish parent analyses.
     """
+    # Resolve cluster before DB work so misconfiguration fails fast
+    cluster = get_hpc_cluster()
+    logging.info("run_server_processing: using cluster=%s", cluster)
     try:
-        cluster = get_hpc_cluster()
-        logging.info("run_server_processing: using cluster=%s", cluster)
 
         # Submit or prepare new analyses for selected cluster
         handle_new_analyses(cluster)

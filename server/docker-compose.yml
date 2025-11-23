@@ -1,12 +1,12 @@
 version: "2.4"
 
 services:
-  cpp-master:
+  cppserver2:
     build:
       context: .
       dockerfile: Dockerfile
-
-    container_name: cppserver2
+    # comment out container name until I run production somewhere else
+    #container_name: cppserver2 
     restart: always
     network_mode: host
     user: "20000:20000"
@@ -26,7 +26,7 @@ services:
     command: python3 /cpp/cpp_server.py
 
     logging:
-      driver: local
+      driver: "json-file"
       options:
         max-size: "50m"
         max-file: "5"
