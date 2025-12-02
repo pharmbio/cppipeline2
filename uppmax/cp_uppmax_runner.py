@@ -21,6 +21,8 @@ import pyarrow.parquet as pq
 
 from s3_client_wrapper import S3ClientWrapper
 
+BUCKET_PREFIX = "proj-"
+
 # ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
@@ -334,9 +336,6 @@ def stage_images_via_s3_files_list(cfg: RunnerConfig, stage_images_file: str) ->
     Fetch listed files via S3 into cfg.stage_root_dir.
     Abort on the FIRST error of any kind.
     """
-    if not cfg.s3_bucket:
-        raise Exception("Missing s3_bucket in config")
-
     os.makedirs(cfg.stage_root_dir, exist_ok=True)
 
     # Build the wrapper here (safer for multiprocessing)
@@ -361,11 +360,20 @@ def stage_images_via_s3_files_list(cfg: RunnerConfig, stage_images_file: str) ->
 
             os.makedirs(os.path.dirname(dest), exist_ok=True)
 
+            # Derive bucket name from path; fall back to cfg.s3_bucket if extraction fails
             try:
-                s3.download_file(cfg.s3_bucket, key, dest, Config=xfer_cfg)
-                logging.info("[stage][S3] fetched %s → %s", key, dest)
+                bucket = get_bucket_from_path(src)
+            except ValueError:
+                bucket = cfg.s3_bucket
+
+            if not bucket:
+                raise Exception("Missing s3_bucket in config and unable to derive bucket from path")
+
+            try:
+                s3.download_file(bucket, key, dest, Config=xfer_cfg)
+                logging.info("[stage][S3] fetched %s → %s from bucket %s", key, dest, bucket)
             except Exception as e:
-                logging.error("[stage][S3] failed for %s: %s", key, e)
+                logging.error("[stage][S3] failed for %s (bucket %s): %s", key, bucket, e)
                 raise
 
 def stage_images_from_file_list(cfg: RunnerConfig, stage_images_file: str) -> None:
@@ -424,6 +432,43 @@ def set_permissions_recursive(path, permissions=0o777):
         for filename in filenames:
             os.chmod(os.path.join(dirpath, filename), permissions)
     logging.debug(f"done set_permissions_recursive {path}")
+
+
+# ----------------------------------------------------------------------------
+# S3 helpers
+# ----------------------------------------------------------------------------
+def _normalize_bucket_label(label: str) -> str:
+    """
+    Minimal normalization for bucket suffix: lowercase and replace '_' and '+' with '-'.
+    """
+    return label.strip().lower().replace("_", "-").replace("+", "-")
+
+
+def get_bucket_name(project: str) -> str:
+    """
+    Build destination bucket name as 'proj-<normalized-project>'.
+    Normalization: lowercase and replace '_' and '+' with '-'.
+    """
+    base = _normalize_bucket_label(project)
+    return f"{BUCKET_PREFIX}{base}"
+
+
+def get_project_from_path(local_path: str) -> str:
+    """
+    Extract project name from a filesystem path.
+    Assumes layout: /share/mikro3/squid/<project>/...
+    i.e. project is the 4th non-empty component from the root.
+    """
+    norm = os.path.normpath(local_path)
+    parts = [p for p in norm.split(os.sep) if p]
+    if len(parts) < 4:
+        raise ValueError(f"Cannot extract project from path (too few components): {local_path}")
+    return parts[3]
+
+
+def get_bucket_from_path(path: str) -> str:
+    project = get_project_from_path(path)
+    return get_bucket_name(project)
 
 
 # ----------------------------------------------------------------------------
