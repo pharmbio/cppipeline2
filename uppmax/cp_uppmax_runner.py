@@ -34,6 +34,10 @@ class RunnerConfig:
     results_dir: str = os.environ.get("RESULT_DIR", "/cpp_work/result")
     pipelines_dir: str = "/cpp_work/pipelines"
     max_workers: int = int(os.environ.get("MAX_WORKERS", "16"))
+    # parallel fetches when staging from S3 (I/O bound so threads help)
+    stage_max_workers: int = int(os.environ.get("STAGE_MAX_WORKERS", "4"))
+    # set to "0" to force single-threaded S3 staging
+    stage_s3_threaded: bool = os.environ.get("STAGE_S3_THREADED", "1") != "0"
     # stagger the first `max_workers` process launches (seconds between starts)
     startup_stagger_sec: float = float(os.environ.get("STARTUP_STAGGER_SEC", "0.3"))
     max_errors: int = int(os.environ.get("MAX_ERRORS", "5"))
@@ -343,6 +347,65 @@ def stage_images_via_s3_files_list(cfg: RunnerConfig, stage_images_file: str) ->
     s3 = client_wrapper.get_fresh_s3_client()
     assert s3 is not None
 
+    stage_workers = max(1, cfg.stage_max_workers)
+    xfer_cfg = TransferConfig(num_download_attempts=1, max_concurrency=stage_workers)
+
+    with open(stage_images_file, "r") as f:
+        srcs = [line.strip() for line in f if line.strip()]
+
+    # De-dupe to avoid racing on the same dest path
+    seen = set()
+    srcs = [src for src in srcs if not (src in seen or seen.add(src))]
+
+    def _download(src: str) -> None:
+        key = src.lstrip("/")
+        dest = os.path.join(cfg.stage_root_dir, key)
+
+        if os.path.exists(dest):
+            logging.debug("[stage][S3] exists, skipping: %s", dest)
+            return
+
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+        try:
+            bucket = get_bucket_from_path(src)
+        except ValueError:
+            bucket = cfg.s3_bucket
+
+        if not bucket:
+            raise Exception("Missing s3_bucket in config and unable to derive bucket from path")
+
+        try:
+            s3.download_file(bucket, key, dest, Config=xfer_cfg)
+            logging.info("[stage][S3] fetched %s → %s from bucket %s", key, dest, bucket)
+        except Exception as e:
+            logging.error("[stage][S3] failed for %s (bucket %s): %s", key, bucket, e)
+            raise
+
+    logging.info("[stage][S3] staging %d files with %d threads", len(srcs), stage_workers)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=stage_workers) as executor:
+        future_map = {executor.submit(_download, src): src for src in srcs}
+        try:
+            for future in concurrent.futures.as_completed(future_map):
+                future.result()  # raises on first failure
+        except Exception:
+            for fut in future_map:
+                fut.cancel()
+            raise
+
+
+def stage_images_via_s3_files_list_unthreaded(cfg: RunnerConfig, stage_images_file: str) -> None:
+    """
+    Single-threaded S3 staging fallback (previous behavior).
+    Abort on the FIRST error of any kind.
+    """
+    os.makedirs(cfg.stage_root_dir, exist_ok=True)
+
+    client_wrapper = _make_s3_wrapper(cfg)
+    s3 = client_wrapper.get_fresh_s3_client()
+    assert s3 is not None
+
     xfer_cfg = TransferConfig(num_download_attempts=1, max_concurrency=1)
 
     with open(stage_images_file, "r") as f:
@@ -360,7 +423,6 @@ def stage_images_via_s3_files_list(cfg: RunnerConfig, stage_images_file: str) ->
 
             os.makedirs(os.path.dirname(dest), exist_ok=True)
 
-            # Derive bucket name from path; fall back to cfg.s3_bucket if extraction fails
             try:
                 bucket = get_bucket_from_path(src)
             except ValueError:
@@ -390,7 +452,10 @@ def stage_images_from_file_list(cfg: RunnerConfig, stage_images_file: str) -> No
     if method == "s3":
         try:
             stage_start = time.time()
-            stage_images_via_s3_files_list(cfg, stage_images_file)
+            if cfg.stage_s3_threaded:
+                stage_images_via_s3_files_list(cfg, stage_images_file)
+            else:
+                stage_images_via_s3_files_list_unthreaded(cfg, stage_images_file)
             logging.info("[stage] S3 succeeded for %s in %.2fs", stage_images_file, time.time() - stage_start)
             return
         except Exception as e:
