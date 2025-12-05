@@ -25,7 +25,7 @@ def build_ssh_cmd_squeue(user: str, hostname: str) -> str:
 def build_ssh_cmd_sacct(user: str, hostname: str) -> str:
     """
     Builds the SSH command for executing sacct on the remote cluster.
-    Includes JobID, JobName, and State.
+    Includes JobID, JobName, State and Elapsed.
     """
     logging.info(f"Building SSH command for sacct")
 
@@ -33,9 +33,9 @@ def build_ssh_cmd_sacct(user: str, hostname: str) -> str:
     start_time = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
 
     # Include JobName in the sacct output format
-    # The format order: JobID,JobName,State
+    # The format order: JobID,JobName,State,Elapsed
     cmd = (f"ssh -o StrictHostKeyChecking=no {user}@{hostname} "
-           f"'sacct --format=\"JobID,JobName%100,State\" --starttime={start_time} --user={user}'")
+           f"'sacct --format=\"JobID,JobName%100,State,Elapsed\" --starttime={start_time} --user={user}'")
 
     logging.debug(f"sacct SSH Command: {cmd}")
     return cmd
@@ -59,19 +59,21 @@ def build_ssh_cmd_sbatch_hpc(analysis: Analysis, run_location: str):
     if run_location == 'rackham':
         return build_ssh_cmd_sbatch_rackham(analysis)
     elif run_location == 'pelle':
-        return build_ssh_cmd_sbatch_hpc(analysis, 'pelle')
+        return build_ssh_cmd_sbatch_hpc_for_cluster(analysis, 'pelle')
     elif run_location == 'hpc_dev':
-        return build_ssh_cmd_sbatch_hpc(analysis, 'hpc_dev')
+        return build_ssh_cmd_sbatch_hpc_for_cluster(analysis, 'hpc_dev')
     elif run_location == 'uppmax':
-        return build_ssh_cmd_sbatch_hpc(analysis, 'pelle')
+        # Currently map uppmax jobs onto the pelle cluster configuration.
+        return build_ssh_cmd_sbatch_hpc_for_cluster(analysis, 'pelle')
     elif run_location == 'farmbio':
         raise NotImplementedError("run_location 'farmbio' mapping not implemented in build_ssh_cmd_sbatch_hpc")
     else:
         raise ValueError(f"No valid run location in build_ssh_cmd_sbatch_hpc, run_loc={run_location}")
 
-def build_ssh_cmd_sbatch_hpc(analysis: Analysis, cluster_name: str):
 
-    logging.info(f"Inside build_ssh_cmd_sbatch_hpc: {cluster_name}, id {analysis.sub_id}, sub_type {analysis.sub_type}")
+def build_ssh_cmd_sbatch_hpc_for_cluster(analysis: Analysis, cluster_name: str):
+
+    logging.info(f"Inside build_ssh_cmd_sbatch_hpc_for_cluster: {cluster_name}, id {analysis.sub_id}, sub_type {analysis.sub_type}")
 
     cluster_cfg = CONFIG.cluster.get(cluster_name)
     if not cluster_cfg:
@@ -364,22 +366,24 @@ def parse_squeue_output(output: str) -> list[dict]:
 
 def parse_sacct_output(output: str) -> list[dict]:
     """
-    Parses sacct output into a list of job statuses including job_id, state, analysis_id, and sub_id.
+    Parses sacct output into a list of job statuses including job_id, state, elapsed, analysis_id, and sub_id.
     Skips job steps like batch or extern entries that are not primary jobs.
     """
     job_statuses = []
     # Regex for extracting analysis_id and sub_id from job name
     name_pattern = re.compile(r"cpp_(\d+)_(\d+)_")
 
-    # Expected sacct format: JobID, JobName (width extended), State
-    # The header line might look like: "JobID JobName State ..."
+    # Expected sacct format: JobID, JobName (width extended), State, Elapsed
+    # The header line might look like: "JobID JobName State Elapsed ..."
     for line in output.splitlines()[1:]:  # Skip the header
         parts = line.split()
-        # We expect at least 3 parts: JobID, JobName, State
-        if len(parts) >= 3:
+        # We expect at least 4 parts: JobID, JobName, State, Elapsed
+        if len(parts) >= 4:
             job_id = parts[0]
             job_name = parts[1]
-            state = parts[-1]  # State should be the last field
+            # Robust to potential additional trailing fields by indexing from the end
+            state = parts[-2]
+            elapsed = parts[-1]
 
             # Skip if job_id contains a dot, indicating a job step (e.g., .batch, .extern)
             if '.' in job_id:
@@ -392,6 +396,7 @@ def parse_sacct_output(output: str) -> list[dict]:
                 job_statuses.append({
                     "job_id": job_id.strip(),
                     "state": state.strip(),
+                    "elapsed": elapsed.strip(),
                     "analysis_id": analysis_id,
                     "sub_id": sub_id
                 })
@@ -414,6 +419,7 @@ def update_job_status_in_db(job_statuses: list[dict], db: 'Database'):
         try:
             job_id = job_status['job_id']
             state = job_status['state']
+            elapsed = job_status.get('elapsed')
 
             # Convert analysis_id to integer if it's not already
             analysis_id = int(job_status['analysis_id'])
@@ -423,8 +429,11 @@ def update_job_status_in_db(job_statuses: list[dict], db: 'Database'):
             # Get a connection from the connection pool
             conn = db.get_connection()
             with conn.cursor() as cursor:
-                # Convert the job state to a JSON string
-                status_json = json.dumps({"uppmax-status": state})
+                # Convert the job state (and optional elapsed) to a JSON string
+                status_payload = {"uppmax-status": state}
+                if elapsed is not None:
+                    status_payload["uppmax-elapsed"] = elapsed
+                status_json = json.dumps(status_payload)
 
                 # Use COALESCE to handle NULL status and treat it as an empty JSON object.
                 query = """

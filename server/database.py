@@ -149,7 +149,7 @@ class Database:
     # Dependency Checking Methods
     # -------------------------------------------------------------------------
     def check_analyses_finished(self, analyses: List[Dict[str, Any]]) -> bool:
-        logging.info("Inside check_analyses_finished")
+        logging.debug("Inside check_analyses_finished")
         for analysis in analyses:
             if not analysis.get('finish'):
                 return False
@@ -183,7 +183,7 @@ class Database:
     # New Method: Get the First (Minimum) Z Plane.
     # -------------------------------------------------------------------------
     def get_middle_z_plane(self, acq_id) -> Optional[Any]:
-        logging.info(f'Fetching minimum z-plane for plate acquisition ID: {acq_id}')
+        logging.debug(f'Fetching minimum z-plane for plate acquisition ID: {acq_id}')
         conn = None
         try:
             conn = self.get_connection()
@@ -309,7 +309,7 @@ class Database:
         return analyses
 
     def get_analysis(self, sub_id: int) -> Optional[Analysis]:
-        logging.info(f'Fetching analysis for sub_id {sub_id}')
+        logging.debug(f'Fetching analysis for sub_id {sub_id}')
         query = (
             "SELECT * "
             "FROM image_sub_analyses_v1 "

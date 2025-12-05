@@ -41,6 +41,62 @@ def _list_subdirs(path: str) -> List[str]:
     except FileNotFoundError:
         return []
 
+def _parse_elapsed_to_timedelta(elapsed_str: str) -> Optional[datetime.timedelta]:
+    """
+    Parse an elapsed time string from sacct (e.g. '01:23:45' or '2-01:23:45')
+    into a timedelta. Returns None on parse failure.
+    """
+    if not elapsed_str:
+        return None
+    try:
+        s = str(elapsed_str).strip()
+        # Optional days prefix: D-HH:MM:SS
+        m = re.match(r"^(?:(\d+)-)?(\d{1,2}):(\d{2}):(\d{2})$", s)
+        if not m:
+            return None
+        days = int(m.group(1) or 0)
+        hours = int(m.group(2))
+        minutes = int(m.group(3))
+        seconds = int(m.group(4))
+        return datetime.timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
+    except Exception:
+        return None
+
+
+def _get_analysis_elapsed_from_status(analysis_id: int) -> Optional[datetime.timedelta]:
+    """
+    Fetch uppmax-elapsed from image_analyses.status and return as timedelta.
+    Falls back to None if not present or on error.
+    """
+    db = Database.get_instance()
+    conn = None
+    try:
+        conn = db.get_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT status FROM image_analyses WHERE id=%s", (analysis_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            status_val = row.get("status")
+            if status_val is None:
+                return None
+            if isinstance(status_val, dict):
+                status_json = status_val
+            else:
+                try:
+                    status_json = json.loads(status_val)
+                except Exception:
+                    return None
+            elapsed_str = status_json.get("uppmax-elapsed")
+            return _parse_elapsed_to_timedelta(elapsed_str)
+    except Exception:
+        logging.error("Error fetching uppmax-elapsed for analysis_id=%s", analysis_id, exc_info=True)
+        return None
+    finally:
+        if conn:
+            db.release_connection(conn)
+
+
 def _get_sub_analysis_start(sub_id: int) -> Optional[datetime.datetime]:
     db = Database.get_instance()
     conn = None
@@ -67,17 +123,22 @@ def _update_progress(analysis_id: int, sub_id: int, done: int, total: int) -> No
     # Estimate remaining time if we have at least one finished job
     progress_str = f"{done} / {total} jobs finished"
     if done > 0:
-        start_time = _get_sub_analysis_start(sub_id)
-        if start_time:
-            # Use tz-aware now if start_time is tz-aware to avoid naive/aware mismatch
-            try:
-                if getattr(start_time, 'tzinfo', None):
-                    now_ts = datetime.datetime.now(start_time.tzinfo)
-                else:
-                    now_ts = datetime.datetime.now()
-                elapsed = now_ts - start_time
-            except Exception:
-                elapsed = datetime.datetime.now() - start_time
+        # Prefer elapsed time reported by HPC via uppmax-elapsed in status;
+        # fall back to DB start timestamp if unavailable.
+        elapsed = _get_analysis_elapsed_from_status(analysis_id)
+        if elapsed is None:
+            start_time = _get_sub_analysis_start(sub_id)
+            if start_time:
+                # Use tz-aware now if start_time is tz-aware to avoid naive/aware mismatch
+                try:
+                    if getattr(start_time, 'tzinfo', None):
+                        now_ts = datetime.datetime.now(start_time.tzinfo)
+                    else:
+                        now_ts = datetime.datetime.now()
+                    elapsed = now_ts - start_time
+                except Exception:
+                    elapsed = datetime.datetime.now() - start_time
+        if elapsed is not None:
             try:
                 avg = elapsed.total_seconds() / max(done, 1)
                 remain = max(total - done, 0) * avg
