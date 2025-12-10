@@ -773,6 +773,7 @@ def run_pipeline(cfg: RunnerConfig) -> None:
 
     logging.info("inside run_pipeline()")
 
+    success = False
     try:
         start_time = time.time()
 
@@ -808,6 +809,7 @@ def run_pipeline(cfg: RunnerConfig) -> None:
         minutes, seconds = divmod(remainder, 60)
         logging.info(f"elapsed: {int(hours)}h {int(minutes)}m {seconds:.2f}s")
 
+        success = True
     except Exception as e:
         logging.error("Exception out of script: %s", e, exc_info=True)
         try:
@@ -823,6 +825,18 @@ def run_pipeline(cfg: RunnerConfig) -> None:
 
     finally:
         if cfg.output_dir:
+            if success:
+                try:
+                    finished_path = Path(cfg.output_dir) / "finished"
+                    os.makedirs(finished_path.parent, exist_ok=True)
+                    with open(finished_path, "w") as finished_file:
+                        finished_file.write(f"Finished at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        finished_file.flush()
+                        os.fsync(finished_file.fileno())
+                    logging.info("Wrote finished marker to %s", finished_path)
+                except Exception:
+                    logging.exception("Failed to write finished marker file")
+
             set_permissions_recursive(cfg.output_dir, 0o777)
             retry_operation(
                 lambda: sync_analysis_output_dir_to_remote(cfg.output_dir),
