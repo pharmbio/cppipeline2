@@ -401,16 +401,41 @@ def fetch_finished_subanalyses_hpc(cluster: str) -> Dict[int, List[Dict[str, Any
             # If checking fails, proceed without crashing the loop
             logging.debug("Failed checking top-level error marker for sub_id=%s", analysis.sub_id)
 
-        # Second Get all finished jobs
-        finished_list, total_jobs = get_list_of_finished_jobs(analysis, finished_only=True, exclude_errors=True)
-        done = len(finished_list)
+        # Second: Get all finished jobs that did NOT error out
+        finished_list, total_jobs = get_list_of_finished_jobs(
+            analysis,
+            finished_only=True,
+            exclude_errors=True,
+        )
+        successful_jobs = len(finished_list)
+
+        # Third: Count jobs that have an error marker
+        error_jobs = 0
+        try:
+            job_dirs = _list_subdirs(analysis.sub_output_dir)
+            for jd in job_dirs:
+                job_path = os.path.join(analysis.sub_output_dir, jd)
+                if os.path.exists(os.path.join(job_path, "error")):
+                    error_jobs += 1
+        except Exception:
+            logging.debug("Failed listing job dirs for sub_id=%s", analysis.sub_id)
+
+        # Treat both finished and errored jobs as contributing to "done" count;
+        # max_errors is not used in the completion logic here.
+        effective_done = successful_jobs + error_jobs
 
         if total_jobs is not None:
-            _update_progress(analysis.id, analysis.sub_id, done, total_jobs)
+            _update_progress(analysis.id, analysis.sub_id, effective_done, total_jobs or 0)
 
-        # If all done, emit as finished for this sub_id
-        if total_jobs is not None and done == total_jobs and total_jobs > 0:
-            finished_by_sub[analysis.sub_id] = finished_list
+        # A global/top-level "finished" marker always means the sub-analysis is done,
+        # regardless of how many jobs finished or errored. Job counts are only used
+        # for progress estimation above.
+        try:
+            finished_marker = os.path.join(analysis.sub_output_dir, "finished")
+            if os.path.exists(finished_marker):
+                finished_by_sub[analysis.sub_id] = finished_list
+        except Exception:
+            logging.warning("Failed checking top-level finished marker for sub_id=%s", analysis.sub_id)
 
     logging.info("Finished sub-analyses: %d", len(finished_by_sub))
     return finished_by_sub
@@ -677,7 +702,7 @@ def move_job_results_to_storage(analysis: Analysis, job_list: List[Dict[str, Any
     # For each finished job, move result files except skipped ones
     for job in job_list:
         job_name = job['metadata']['name']
-        job_path = f"/cpp_work/output/{analysis.sub_id}/{job_name}"
+        job_path = os.path.join(analysis.sub_output_dir.rstrip('/'), job_name)
 
         if not os.path.exists(job_path):
             logging.warning(f"Job path does not exist, skipping: {job_path}")

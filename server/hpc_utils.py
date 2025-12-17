@@ -420,6 +420,7 @@ def update_job_status_in_db(job_statuses: list[dict], db: 'Database'):
             job_id = job_status['job_id']
             state = job_status['state']
             elapsed = job_status.get('elapsed')
+            sub_id = job_status.get('sub_id')
 
             # Convert analysis_id to integer if it's not already
             analysis_id = int(job_status['analysis_id'])
@@ -436,18 +437,35 @@ def update_job_status_in_db(job_statuses: list[dict], db: 'Database'):
                 status_json = json.dumps(status_payload)
 
                 # Use COALESCE to handle NULL status and treat it as an empty JSON object.
-                query = """
+                # 1) Update parent analysis row
+                query_parent = """
                     UPDATE image_analyses
                     SET status = COALESCE(status, '{}'::jsonb) || %s::jsonb
                     WHERE id = %s
                 """
 
                 # Log the exact query with substituted parameters using mogrify
-                query_with_params = cursor.mogrify(query, [status_json, analysis_id]).decode('utf-8')
-                logging.debug(f"Executing query: {query_with_params}")
+                query_parent_with_params = cursor.mogrify(query_parent, [status_json, analysis_id]).decode('utf-8')
+                logging.debug(f"Executing parent status update query: {query_parent_with_params}")
 
-                # Execute the update query
-                cursor.execute(query, [status_json, analysis_id])
+                # Execute the update query for parent analysis
+                cursor.execute(query_parent, [status_json, analysis_id])
+
+                # 2) Update sub-analysis row, if we have a sub_id
+                if sub_id is not None:
+                    try:
+                        sub_id_int = int(sub_id)
+                        query_sub = """
+                            UPDATE image_sub_analyses
+                               SET status = COALESCE(status, '{}'::jsonb) || %s::jsonb
+                             WHERE sub_id = %s
+                        """
+                        query_sub_with_params = cursor.mogrify(query_sub, [status_json, sub_id_int]).decode('utf-8')
+                        logging.debug(f"Executing sub-analysis status update query: {query_sub_with_params}")
+                        cursor.execute(query_sub, [status_json, sub_id_int])
+                    except Exception:
+                        logging.error("Failed to update sub-analysis status; sub_id=%s", sub_id, exc_info=True)
+
                 conn.commit()
 
                 logging.debug(f"Successfully updated job {job_id} with state {state}")
