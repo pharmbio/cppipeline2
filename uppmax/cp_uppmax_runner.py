@@ -553,8 +553,10 @@ def run_cmd(cmd: str, cfg: RunnerConfig):
     # use cfg inside here
     logging.info("run_cmd %s (stage_root=%s)", cmd, cfg.stage_root_dir)
 
+    worker_pid = os.getpid()
     job_output_dir = None
     proc = None  # Initialize proc outside the try block
+    cmd_start_time = None
     try:
         if cmd is None or cmd.isspace():
             logging.error(f"return becatce cmd is None or cmd.isspace()")
@@ -577,6 +579,15 @@ def run_cmd(cmd: str, cfg: RunnerConfig):
             logging.info(f"Finished file exists, skipping this cmd")
             return
 
+        # If an old error marker exists, remove it before rerun
+        error_flag_path = os.path.join(job_output_dir, "error")
+        if os.path.exists(error_flag_path):
+            try:
+                os.remove(error_flag_path)
+                logging.info("Removed stale error marker: %s", error_flag_path)
+            except Exception:
+                logging.exception("Failed to remove stale error marker: %s", error_flag_path)
+
         # Ensure the output directory exists
         os.makedirs(job_output_dir, exist_ok=True)
         os.chmod(job_output_dir, 0o0777)
@@ -595,11 +606,18 @@ def run_cmd(cmd: str, cfg: RunnerConfig):
         os.unlink(tmp_stage_file)
 
         # Execute the command and redirect stdout and stderr to a log file
+        logging.info("Starting cmd in worker pid %s", worker_pid)
         logging.info(f"cp logfile: {log_file_path}")
         with open(log_file_path, 'w') as log_file:
+            cmd_start_time = time.time()
             proc = subprocess.Popen(cmd, shell=True, stdout=log_file, stderr=subprocess.STDOUT)
+            logging.info("Spawned child pid %s for cmd", proc.pid)
             active_processes.append(proc)
             stdout, stderr = proc.communicate()  # Wait for the subprocess to complete
+            logging.info("Command return code: %s", proc.returncode)
+            if cmd_start_time is not None:
+                elapsed = time.time() - cmd_start_time
+                logging.info("Command duration: %.2f seconds", elapsed)
 
         # Check the exit status of the subprocess
         if proc.returncode != 0:
@@ -660,31 +678,44 @@ def run_all_commands_via_threadpool(
 
     start_time = time.time()
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=cfg.max_workers) as executor:
-        futures = {}
-        for i, cmd in enumerate(cmds):
-            futures[executor.submit(run_cmd, cmd, cfg)] = cmd
-            # Stagger only the first `workers` starts
-            if i < cfg.max_workers - 1 and cfg.startup_stagger_sec > 0:
-                time.sleep(cfg.startup_stagger_sec)
+    remaining_cmds = list(cmds)
+    finished = errors = 0
 
-        pending = len(futures)
-        finished = errors = 0
-
-        for future in concurrent.futures.as_completed(futures):
-            cmd = futures[future]
+    # Loop lets us recreate the pool if it breaks mid-run.
+    while remaining_cmds:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=cfg.max_workers) as executor:
+            futures = {}
             try:
-                future.result()
-                finished += 1
-            except Exception:
-                logging.exception("Error running command %s", cmd)
-                errors += 1
-            pending -= 1
-            elapsed_minutes = (time.time() - start_time) / 60
-            logging.info("Pending: %d, Finished: %d, Errors: %d, Time: %.2f min",
-                         pending, finished, errors, elapsed_minutes)
-            if errors > cfg.max_errors:
-                raise Exception(f"More errors than max_errors: {errors} > {cfg.max_errors}")
+                for i, cmd in enumerate(remaining_cmds):
+                    futures[executor.submit(run_cmd, cmd, cfg)] = cmd
+                    # Stagger only the first `workers` starts
+                    if i < cfg.max_workers - 1 and cfg.startup_stagger_sec > 0:
+                        time.sleep(cfg.startup_stagger_sec)
+
+                pending = len(futures)
+                for future in concurrent.futures.as_completed(futures):
+                    cmd = futures[future]
+                    try:
+                        future.result()
+                        finished += 1
+                    except concurrent.futures.process.BrokenProcessPool:
+                        raise
+                    except Exception:
+                        logging.exception("Error running command %s", cmd)
+                        errors += 1
+                    pending -= 1
+                    elapsed_minutes = (time.time() - start_time) / 60
+                    logging.info("Pending: %d, Finished: %d, Errors: %d, Time: %.2f min",
+                                 pending, finished, errors, elapsed_minutes)
+                    if errors > cfg.max_errors:
+                        raise Exception(f"More errors than max_errors: {errors} > {cfg.max_errors}")
+                remaining_cmds = []
+            except concurrent.futures.process.BrokenProcessPool:
+                logging.exception("Process pool broke; restarting pool for remaining commands")
+                remaining_cmds = [cmd for fut, cmd in futures.items() if not fut.done()]
+
+    if errors > cfg.max_errors:
+        raise Exception(f"More errors than max_errors: {errors} > {cfg.max_errors}")
 
 def setup_logging(level=logging.INFO, log_path: Optional[str] = None):
     formatter = logging.Formatter(
