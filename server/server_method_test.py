@@ -53,8 +53,8 @@ cpp_server.init_new_db()
 #test_prepare_all_analyses()
 
 # Test 7
-#analysis = Database.get_instance().get_analysis(12893)
-#cmd = cpp_server.prepare_analysis_cellprofiler_hpc(analysis)
+analysis = Database.get_instance().get_analysis(16212)
+cmd = cpp_server.prepare_analysis_cellprofiler_hpc(analysis)
 #logging.info(f"cmd: {cmd}")
 
 # Test 8
@@ -222,5 +222,5 @@ def move_missing_files_from_output():
         files_created = cpp_server.move_job_results_to_storage(analysis, finished_list)
         logging.info("sub_id=%s files_created=%s", sub_id, len(files_created))
 
-move_missing_files_from_output()
+#move_missing_files_from_output()
 

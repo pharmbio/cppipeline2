@@ -503,6 +503,41 @@ class Database:
             if conn:
                 self.release_connection(conn)
 
+    # -------------------------------------------------------------------------
+    # Plate Acquisition Helpers
+    # -------------------------------------------------------------------------
+    def is_plate_acquisition_finished(self, plate_acquisition_id: Any) -> bool:
+        """
+        Return True if the given plate_acquisition row exists and its
+        finished column is not NULL. Returns False on missing ID, missing row,
+        or on any error.
+        """
+        if not plate_acquisition_id:
+            return False
+
+        conn = None
+        try:
+            conn = self.get_connection()
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT finished IS NOT NULL FROM plate_acquisition WHERE id = %s",
+                    (plate_acquisition_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return False
+                return bool(row[0])
+        except Exception as e:
+            logging.error(
+                "Error checking plate_acquisition.finished for id %s: %s",
+                plate_acquisition_id,
+                e,
+            )
+            return False
+        finally:
+            if conn:
+                self.release_connection(conn)
+
 
 # -----------------------------------------------------------------------------
 # Analysis Class
@@ -531,6 +566,19 @@ class Analysis:
     @property
     def finished(self) -> bool:
         return self._data.get('finish') is not None
+
+    @property
+    def is_plate_acquisition_finished(self) -> bool:
+        """
+        Return True if the associated plate_acquisition row exists and its
+        finished column is not NULL. Returns False on missing ID, missing row,
+        or on any error.
+        """
+        if not self.plate_acquisition_id:
+            return False
+
+        db = Database.get_instance()
+        return db.is_plate_acquisition_finished(self.plate_acquisition_id)
 
     @property
     def results_dir(self) -> str:

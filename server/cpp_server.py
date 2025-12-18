@@ -437,7 +437,12 @@ def fetch_finished_subanalyses_hpc(cluster: str) -> Dict[int, List[Dict[str, Any
         except Exception:
             logging.warning("Failed checking top-level finished marker for sub_id=%s", analysis.sub_id)
 
-    logging.info("Finished sub-analyses: %d", len(finished_by_sub))
+    finished_sub_ids = sorted(finished_by_sub.keys())
+    logging.info(
+        "Finished sub-analyses: %d (sub_ids=%s)",
+        len(finished_by_sub),
+        finished_sub_ids,
+    )
     return finished_by_sub
 
 
@@ -521,6 +526,15 @@ def prepare_analysis_cellprofiler_hpc(analysis: Analysis):
         # Validate required fields
         if not analysis.plate_acquisition_id:
             raise ValueError(f"Missing or wrong plate_acquisition_id for sub_id {analysis.sub_id}")
+
+        # Warn if analysis is submitted before the plate acquisition is marked finished
+        if not analysis.is_plate_acquisition_finished:
+            Database.get_instance().set_status(
+                analysis.id,
+                analysis.sub_id,
+                "messages",
+                "analysis submitted before plate acquisition was finished",
+            )
 
         # Ensure input/output directories exist
         os.makedirs(analysis.sub_input_dir, exist_ok=True)
@@ -689,7 +703,12 @@ def move_job_results_to_storage(analysis: Analysis, job_list: List[Dict[str, Any
 
     Returns a list of file paths (relative to analysis storage) that were created.
     """
-    logging.info("Inside move_job_results_to_storage")
+    logging.info(
+        "Inside move_job_results_to_storage: sub_id=%s analysis_id=%s n_jobs=%d",
+        analysis.sub_id,
+        analysis.id,
+        len(job_list),
+    )
 
     skip_suffixes = {'.csv', '.log'}
     skip_files = {'finished', 'error'}
@@ -738,7 +757,12 @@ def move_job_results_to_storage(analysis: Analysis, job_list: List[Dict[str, Any
             shutil.move(str(parquet_file), dest_path)
             files_created.append(filename)
 
-    logging.info("Done move_job_results_to_storage: %d files", len(files_created))
+    logging.info(
+        "Done move_job_results_to_storage: sub_id=%s analysis_id=%s files=%d",
+        analysis.sub_id,
+        analysis.id,
+        len(files_created),
+    )
 
     return files_created
 
