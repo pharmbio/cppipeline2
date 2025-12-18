@@ -802,7 +802,7 @@ def test_run_sync_analysis_output_dir_to_remote(**overrides):
 
 def run_pipeline(cfg: RunnerConfig) -> None:
 
-    logging.info("inside run_pipeline()")
+    logging.info("inside run_pipeline() %s", Path(__file__).resolve())
 
     success = False
     try:
