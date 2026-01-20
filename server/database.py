@@ -548,6 +548,8 @@ class Analysis:
         self._data = data
         # Cache for channel map, keyed by channel (int) with dye name (str)
         self._cached_channelmap: Optional[Dict[int, str]] = None
+        # Cache for imgset batches used to derive job counts, etc.
+        self._cached_imgset_batches: Optional[List[List["ImageSet"]]] = None
         # Soft validation flags to allow early guards without raising
         self.is_valid: bool = True
         self.invalid_reason: Optional[str] = None
@@ -671,6 +673,47 @@ class Analysis:
             logging.warning(f"Invalid job_timeout '{val}', defaulting to 10800")
             return 10800
 
+    @property
+    def max_errors(self) -> int:
+        """
+        Return max_errors from metadata.
+
+        If not provided or invalid, defaults to 1% of the
+        planned number of jobs for this analysis (floored),
+        e.g. 1% of 10 jobs -> 0.
+        """
+        DEFAULT_PERCENT = 0.01
+        analysis_meta = self.meta
+        # Explicit override from meta, if present
+        val = analysis_meta.get("max_errors")
+        if val is not None:
+            try:
+                return int(val)
+            except Exception as e:
+                logging.error(f"Error converting max_errors to int: {e}")
+
+        # Fallback: derive from planned jobs (1% of job count, floored)
+        n_jobs = 0
+        try:
+            # get_imgset_batches groups image sets into one batch per job
+            batches = self.get_imgset_batches()
+            n_jobs = len(batches)
+        except Exception as e:
+            logging.error(f"Error computing planned jobs for max_errors: {e}")
+
+        try:
+            # Base: 1% of planned jobs
+            raw = n_jobs * DEFAULT_PERCENT
+            # Cap at total number of jobs, never more errors than jobs
+            if raw > n_jobs:
+                raw = float(n_jobs)
+            # Floor to integer; for small analyses this will naturally be 0
+            max_errors = int(raw)
+            return max_errors
+        except Exception as e:
+            logging.error(f"Error computing default max_errors from n_jobs={n_jobs}: {e}")
+            return 0
+
     def all_dependencies_satisfied(self) -> bool:
         db = Database.get_instance()
         return db.all_dependencies_satisfied(self._data)
@@ -774,6 +817,29 @@ class Analysis:
             img_sets[imgset_id].add_image(img)
         for set_id, img_set in img_sets.items():
             logging.debug(f"ImageSet {set_id} has {len(img_set.all_images)} images")
+
+        # Consistency check: all image sets must have the same number of images.
+        # This helps detect missing per-channel images or other incompleteness.
+        if img_sets:
+            lengths = {set_id: len(img_set.all_images) for set_id, img_set in img_sets.items()}
+            unique_lengths = set(lengths.values())
+            if len(unique_lengths) > 1:
+                details = ", ".join(f"{sid}={ln}" for sid, ln in lengths.items())
+                msg = (
+                    f"Inconsistent image set sizes for analysis_id={self.id}, sub_id={self.sub_id}; "
+                    f"expected all sets to have same number of images. "
+                    f"Lengths: {details}"
+                )
+                logging.error(msg)
+                try:
+                    Database.get_instance().set_sub_analysis_error(self, msg)
+                except Exception:
+                    logging.error(
+                        "Failed setting sub-analysis error for inconsistent image set sizes",
+                        exc_info=True,
+                    )
+                raise ValueError(msg)
+
         return img_sets
 
     def get_imgset_batches(self, batch_size: Optional[int] = None) -> List[List[ImageSet]]:
@@ -782,19 +848,29 @@ class Analysis:
         If batch_size is -1, all image sets are returned in a single batch.
         If batch_size is not provided, use the value from meta['batch_size'].
         """
+        # Use cached batches when called with default settings
+        cache_result = batch_size is None
+        if cache_result and self._cached_imgset_batches is not None:
+            return self._cached_imgset_batches
+
         if batch_size is None:
             batch_size = self.batch_size
         imgset_dict = self.get_all_imgsets()
         imgset_list = list(imgset_dict.values())
         if batch_size == -1:
             logging.info("Batch size is -1; returning a single batch with all image sets.")
-            return [imgset_list]
+            result = [imgset_list]
+            if cache_result:
+                self._cached_imgset_batches = result
+            return result
         # More verbose batching:
         batches = []
         for i in range(0, len(imgset_list), batch_size):
             batch = imgset_list[i:i + batch_size]
             batches.append(batch)
         logging.info(f"Grouped image sets into {len(batches)} batches (batch size: {batch_size}).")
+        if cache_result:
+            self._cached_imgset_batches = batches
         return batches
 
     def get_channelmap(self) -> Dict[int, str]:
@@ -812,7 +888,27 @@ class Analysis:
         # Optional: filter if channels_filter is in use
         cf = self.channels_filter()
         if cf:
-            result_dict = {ch_id: val for ch_id, val in result_dict.items() if val in cf}
+            # Keep only channels whose dye name is listed in meta['channels']
+            filtered = {ch_id: val for ch_id, val in result_dict.items() if val in cf}
+
+            # Detect any requested channels that are completely missing in the images
+            available_dyes = {val for val in filtered.values()}
+            missing = [ch for ch in cf if ch not in available_dyes]
+            if missing:
+                msg = (
+                    f"Channels in pipeline not found in images for this acq_id={self.plate_acquisition_id},"
+                    f"analysis_id={self.id}, sub_id={self.sub_id}: {', '.join(str(m) for m in missing)}"
+                )
+                logging.error(msg)
+                try:
+                    # Mark this sub-analysis as errored so it won't be scheduled
+                    Database.get_instance().set_sub_analysis_error(self, msg)
+                except Exception as e:
+                    logging.error("Failed setting sub-analysis error for missing channels", exc_info=True)
+                # Raise to abort further processing for this analysis in the current cycle
+                raise ValueError(msg)
+
+            result_dict = filtered
 
         self._cached_channelmap = result_dict
         return result_dict

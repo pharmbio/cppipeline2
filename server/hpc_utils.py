@@ -40,6 +40,7 @@ def build_ssh_cmd_sacct(user: str, hostname: str) -> str:
     logging.debug(f"sacct SSH Command: {cmd}")
     return cmd
 
+
 def build_ssh_cmd_sbatch_hpc(analysis: Analysis, run_location: str):
     """
     Build sbatch command for the target cluster.
@@ -83,7 +84,7 @@ def build_ssh_cmd_sbatch_hpc_for_cluster(analysis: Analysis, cluster_name: str):
     hostname = cluster_cfg['hostname']
     account = cluster_cfg['account']
     appdir = cluster_cfg['appdir']
-    max_errors = 10
+    max_errors = analysis.max_errors
 
     # Resource subtype configuration based on sub_type
     resource_subtype = resources.get(analysis.sub_type, resources['default'])
@@ -258,7 +259,7 @@ def build_ssh_cmd_sbatch_rackham(analysis: Analysis):
     hostname = cluster_cfg['hostname']
     account = cluster_cfg['account']
     appdir = cluster_cfg['appdir']
-    max_errors = 10
+    max_errors = analysis.max_errors
 
     # Resource subtype configuration based on sub_type
     resource_subtype = resources.get(analysis.sub_type, resources['default'])
