@@ -427,6 +427,36 @@ def fetch_finished_subanalyses_hpc(cluster: str) -> Dict[int, List[Dict[str, Any
         if total_jobs is not None:
             _update_progress(analysis.id, analysis.sub_id, effective_done, total_jobs or 0)
 
+        # If we have seen all expected jobs for this sub-analysis and *all*
+        # of them ended in error (i.e. there are no successfully finished jobs),
+        # treat the sub-analysis itself as errored even if no top-level error
+        # marker file exists.
+        try:
+            if (
+                total_jobs is not None
+                and total_jobs > 0
+                and error_jobs == total_jobs
+                and successful_jobs == 0
+            ):
+                msg = (
+                    f"all {total_jobs} jobs for sub-analysis "
+                    f"{analysis.sub_id} ended with error markers"
+                )
+                logging.error(
+                    "All jobs for sub-analysis errored; marking sub-analysis error; "
+                    "sub_id=%s analysis_id=%s",
+                    analysis.sub_id,
+                    analysis.id,
+                )
+                Database.get_instance().set_sub_analysis_error(analysis, msg)
+                # Skip finished-marker handling for this sub in this cycle
+                continue
+        except Exception:
+            logging.debug(
+                "Failed evaluating all-error condition for sub_id=%s",
+                analysis.sub_id,
+            )
+
         # A global/top-level "finished" marker always means the sub-analysis is done,
         # regardless of how many jobs finished or errored. Job counts are only used
         # for progress estimation above.
