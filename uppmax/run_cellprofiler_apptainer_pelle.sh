@@ -62,12 +62,13 @@ export CELLPOSE_LOCAL_MODELS_PATH="/root/.cellpose/models/"
 # --- Apptainer -------------------------------------------------------------
 STAGE_ROOT="$TMPDIR/pharmbio/stage"
 CPP_WORK="$TMPDIR/pharmbio/cpp_work"
-CPP_ROOT="/home/andersl/cppipeline2/uppmax"
+CPP_ROOT="$(pwd)"
 CONTAINER_IMAGE_PATH="/proj/cellprofiling/nobackup/cpp2_uppmax_worker-$CONTAINER_VERSION-latest.sif"
 
 mkdir -p "$STAGE_ROOT/mikro"
 mkdir -p "$STAGE_ROOT/mikro2"
 mkdir -p "$STAGE_ROOT/mikro3"
+mkdir -p "$STAGE_ROOT/mikro4"
 mkdir -p "$STAGE_ROOT/external-datasets"
 mkdir -p "$CPP_WORK/input"
 
@@ -77,6 +78,7 @@ if "$USE_SHELL"; then
         --bind $STAGE_ROOT/mikro:/share/mikro \
         --bind $STAGE_ROOT/mikro2:/share/mikro2 \
         --bind $STAGE_ROOT/mikro3:/share/mikro3 \
+        --bind $STAGE_ROOT/mikro4:/share/mikro4 \
         --bind $STAGE_ROOT/external-datasets:/share/data/external-datasets \
         --bind $CPP_WORK:/cpp_work \
         "$CONTAINER_IMAGE_PATH"
@@ -86,6 +88,7 @@ else
         --bind $STAGE_ROOT/mikro:/share/mikro \
         --bind $STAGE_ROOT/mikro2:/share/mikro2 \
         --bind $STAGE_ROOT/mikro3:/share/mikro3 \
+        --bind $STAGE_ROOT/mikro4:/share/mikro4 \
         --bind $STAGE_ROOT/external-datasets:/share/data/external-datasets \
         --bind $CPP_WORK:/cpp_work \
         "$CONTAINER_IMAGE_PATH" \
