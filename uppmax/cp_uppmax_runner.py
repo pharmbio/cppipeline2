@@ -272,10 +272,17 @@ def stage_images_via_rsync_files_list(cfg: RunnerConfig, stage_images_file: str)
     logging.debug("Rsync command: %s", " ".join(shlex.quote(c) for c in cmd))
 
     try:
-        subprocess.run(cmd, check=True)
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if result.stdout:
+            logging.debug("[stage][rsync] stdout: %s", result.stdout.strip())
+        if result.stderr:
+            logging.debug("[stage][rsync] stderr: %s", result.stderr.strip())
         logging.info("[stage][rsync] fetch completed")
     except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
         logging.error("[stage][rsync] fetch failed: %s", e)
+        if stderr:
+            logging.error("[stage][rsync] stderr: %s", stderr)
         raise
 
 def parse_images_from_datafile(file_path):
