@@ -48,6 +48,9 @@ class RunnerConfig:
     s3_bucket: str = os.environ.get("S3_BUCKET", "mikro")
     s3_endpoint_url: str = os.environ.get("S3_ENDPOINT_URL", "https://s3.spirula.uppmax.uu.se:8443" )
     s3_region: Optional[str] = os.environ.get("AWS_DEFAULT_REGION", None) # default not needed
+    # Restart strategy when a ProcessPoolExecutor breaks mid-run
+    allow_pool_restart: bool = os.environ.get("ALLOW_POOL_RESTART", "1") != "0"
+    max_pool_restarts: int = int(os.environ.get("MAX_POOL_RESTARTS", "3"))
 
 
 def send_slack_warning(message: str) -> None:
@@ -680,6 +683,8 @@ def run_all_commands_via_threadpool(
 
     remaining_cmds = list(cmds)
     finished = errors = 0
+    restart_attempts = 0
+    finished_cmds = set()
 
     # Loop lets us recreate the pool if it breaks mid-run.
     while remaining_cmds:
@@ -698,6 +703,7 @@ def run_all_commands_via_threadpool(
                     try:
                         future.result()
                         finished += 1
+                        finished_cmds.add(cmd)
                     except concurrent.futures.process.BrokenProcessPool:
                         raise
                     except Exception:
@@ -711,8 +717,19 @@ def run_all_commands_via_threadpool(
                         raise Exception(f"More errors than max_errors: {errors} > {cfg.max_errors}")
                 remaining_cmds = []
             except concurrent.futures.process.BrokenProcessPool:
-                logging.exception("Process pool broke; restarting pool for remaining commands")
-                remaining_cmds = [cmd for fut, cmd in futures.items() if not fut.done()]
+                restart_attempts += 1
+                # Treat any command not confirmed finished as pending.
+                pending_cmds = [cmd for cmd in futures.values() if cmd not in finished_cmds]
+                logging.exception(
+                    "Process pool broke; restart attempt %d (pending commands: %d)",
+                    restart_attempts,
+                    len(pending_cmds),
+                )
+                if not cfg.allow_pool_restart or restart_attempts > cfg.max_pool_restarts:
+                    raise RuntimeError(
+                        f"Process pool broke (attempt {restart_attempts}); aborting with {len(pending_cmds)} pending commands"
+                    )
+                remaining_cmds = pending_cmds
 
     if errors > cfg.max_errors:
         raise Exception(f"More errors than max_errors: {errors} > {cfg.max_errors}")
