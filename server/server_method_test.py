@@ -20,6 +20,24 @@ def test_input_dir_synch():
     assert analysis is not None, "analysis missing"
     sync_manager.sync_input_dir(analysis.sub_id)
 
+
+def test_create_sbatch_cmd_for_existing_analysis(sub_id: int):
+    """
+    Build an sbatch command for a real sub-analysis id
+    without actually submitting the job.
+    """
+    analysis = Database.get_instance().get_analysis(sub_id)
+    assert analysis is not None, f"analysis with sub_id {sub_id} not found"
+
+    run_location = analysis.run_location or "pelle"
+    cmd = hpc_utils.build_ssh_cmd_sbatch_hpc(analysis, run_location=run_location)
+
+    logging.info("sbatch cmd for sub_id %s: %s", sub_id, cmd)
+
+    # Basic sanity checks on the constructed command
+    assert "sbatch" in cmd
+    assert f"cpp_{analysis.id}_{analysis.sub_id}_{analysis.sub_type}" in cmd
+
 # .env is loaded centrally in config.py via python-dotenv
 
 cpp_server.setup_logging(logging.INFO)
@@ -53,8 +71,8 @@ cpp_server.init_new_db()
 #test_prepare_all_analyses()
 
 # Test 7
-analysis = Database.get_instance().get_analysis(16212)
-cmd = cpp_server.prepare_analysis_cellprofiler_hpc(analysis)
+#analysis = Database.get_instance().get_analysis(16212)
+#cmd = cpp_server.prepare_analysis_cellprofiler_hpc(analysis)
 #logging.info(f"cmd: {cmd}")
 
 # Test 8
@@ -184,43 +202,6 @@ Traceback (most recent call last):
 
 #test_send_slack_error_message()
 
-def move_missing_files_from_output():
-    
-    subs_to_move = [
-      16108, 16107, 16105, 16058, 16056, 16052, 15981, 15980, 15979, 15972,
-      15971, 15970, 15966, 15965, 15964, 15963, 15962, 15961, 15960, 15959,
-      15958, 15956, 15955, 15954, 15953, 15952, 15951, 15936, 15935, 15934,
-      15933, 15932, 15931, 15930, 15929, 15928, 15927, 15926, 15925, 15924,
-      15923, 15922, 15921, 15920, 15919, 15918, 15917, 15916, 15892, 15891,
-      15890, 15889, 15888, 15887, 15886, 15885, 15884, 15874, 15873, 15872,
-      15871, 15870, 15869, 15868, 15867, 15866, 15862, 15861, 15860, 15859,
-      15858, 15857, 15829, 15825, 15824, 15823, 15822, 15821, 15820, 15819,
-      15818, 15817, 15816, 15812, 15811, 15810, 15809, 15808, 15807, 15806,
-      15798, 15797, 15796, 15795, 15791, 15790, 15789, 15788, 15787, 15786,
-      15785, 15784, 15783, 15782, 15778, 15777, 15776, 15775, 15774, 15773,
-      15772, 15771, 15767, 15766, 15765, 15764, 15763, 15762, 15761, 15760,
-      15756, 15755, 15754, 15753, 15752, 15751, 15750, 15749, 15745, 15744,
-      15743, 15742, 15741, 15740, 15739, 15738, 15737, 15736, 15732, 15731,
-      15730, 15729, 15728, 15727, 15726, 15725, 15721, 15720, 15719, 15718,
-      15717, 15716, 15700, 15699, 15698, 15610, 15609, 15605, 15577, 15576,
-      15536, 15535, 15534, 15533, 15530, 15529, 15525, 15524, 15523, 15501,
-      15498, 15495, 15494, 15480, 15439, 15438, 15437, 15436, 15397, 15396,
-      15393, 15392, 15391, 15390, 15387, 15386, 15382, 15381, 15380, 15375,
-      15374
-    ]
+test_create_sbatch_cmd_for_existing_analysis(16966)
 
-    for sub_id in subs_to_move:
-        analysis = Database.get_instance().get_analysis(sub_id)
-        if not analysis or not analysis.sub_id:
-            continue
-
-        finished_list, total_jobs = cpp_server.get_list_of_finished_jobs(
-            analysis, finished_only=True, exclude_errors=True
-        )
-        logging.info("sub_id=%s finished_list=%s total_jobs=%s", sub_id, len(finished_list), total_jobs)
-
-        files_created = cpp_server.move_job_results_to_storage(analysis, finished_list)
-        logging.info("sub_id=%s files_created=%s", sub_id, len(files_created))
-
-#move_missing_files_from_output()
 

@@ -7,9 +7,128 @@ import os
 import glob
 import math
 
+from dataclasses import dataclass
+from typing import Optional
 from database import Database, Analysis
 from config import CONFIG
 import error_utils
+@dataclass(frozen=True)
+class DynamicResources:
+    workers: int
+    ntasks: int
+    time: str                # "H:MM:SS" TOTAL walltime for whole sbatch job (all waves)
+    mem_gb: Optional[int]    # TOTAL memory for sbatch --mem (GB)
+
+    @staticmethod
+    def _parse_hhmmss_to_minutes(val) -> Optional[int]:
+        if val is None:
+            return None
+        m = re.match(r"^(\d{1,3}):(\d{2}):(\d{2})$", str(val).strip())
+        if not m:
+            return None
+        h = int(m.group(1))
+        mm = int(m.group(2))
+        return h * 60 + mm
+
+    @staticmethod
+    def _parse_gb(val) -> Optional[int]:
+        if val is None:
+            return None
+        s = str(val).strip().upper()
+        s = s.replace("GB", "G")
+        if s.endswith("G"):
+            s = s[:-1]
+        try:
+            return int(s)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _fmt_hhmmss(total_minutes: int) -> str:
+        total_minutes = max(1, int(total_minutes))
+        h = total_minutes // 60
+        mm = total_minutes % 60
+        return f"{h}:{mm:02d}:00"
+
+    # ---- TIME rules ----
+
+    @classmethod
+    def _resolve_minutes_per_wave(cls, analysis, resource_subtype: dict) -> int:
+        # analysis.estimated_job_time overrides subtype.estimated_job_time
+        return (
+            cls._parse_hhmmss_to_minutes(getattr(analysis, "estimated_job_time", None))
+            or cls._parse_hhmmss_to_minutes(resource_subtype.get("estimated_job_time"))
+            or 60
+        )
+
+    @classmethod
+    def _resolve_max_total_time_minutes(cls, analysis, resource_subtype: dict) -> Optional[int]:
+        # analysis.time overrides subtype.time
+        return (
+            cls._parse_hhmmss_to_minutes(getattr(analysis, "time", None))
+            or cls._parse_hhmmss_to_minutes(resource_subtype.get("time"))
+        )
+
+    # ---- MEM rules ----
+
+    @classmethod
+    def _resolve_mem_per_worker_gb(cls, analysis, resource_subtype: dict) -> Optional[int]:
+        # analysis.estimated_job_mem overrides subtype.estimated_job_mem
+        return (
+            cls._parse_gb(getattr(analysis, "estimated_job_mem", None))
+            or cls._parse_gb(resource_subtype.get("estimated_job_mem"))
+        )
+
+    @classmethod
+    def _resolve_max_total_mem_gb(cls, analysis, resource_subtype: dict) -> Optional[int]:
+        # analysis.mem overrides subtype.mem  (TOTAL cap)
+        return (
+            cls._parse_gb(getattr(analysis, "mem", None))
+            or cls._parse_gb(resource_subtype.get("mem"))
+        )
+
+    @classmethod
+    def from_analysis_and_subtype(
+        cls,
+        *,
+        analysis,
+        resource_subtype: dict,
+        n_jobs: int,
+        workers_cfg: int,
+        ntasks_cfg: int,
+        time_multiplier: float = 1.15,
+        time_overhead_min: int = 5,
+        mem_overhead_gb: int = 1,
+    ) -> "DynamicResources":
+        n_jobs_eff = max(0, int(n_jobs))
+        workers_cfg = max(1, int(workers_cfg))
+        ntasks_cfg = max(1, int(ntasks_cfg))
+
+        # Concurrency
+        workers = max(1, min(workers_cfg, n_jobs_eff if n_jobs_eff > 0 else 1))
+        ntasks = max(1, min(ntasks_cfg, workers))
+
+        # Waves
+        waves = max(1, math.ceil(n_jobs_eff / workers)) if n_jobs_eff > 0 else 1
+
+        # ---- TOTAL TIME = waves * minutes_per_wave, capped by max_total_time ----
+        minutes_per_wave = cls._resolve_minutes_per_wave(analysis, resource_subtype)
+        est_total_min = int(math.ceil(waves * minutes_per_wave * time_multiplier + time_overhead_min))
+        cap_total_min = cls._resolve_max_total_time_minutes(analysis, resource_subtype)
+        total_min = min(est_total_min, cap_total_min) if cap_total_min is not None else est_total_min
+        time_str = cls._fmt_hhmmss(total_min)
+
+        # ---- TOTAL MEM = workers * mem_per_worker, capped by max_total_mem ----
+        mem_per_worker_gb = cls._resolve_mem_per_worker_gb(analysis, resource_subtype)
+        cap_total_mem_gb = cls._resolve_max_total_mem_gb(analysis, resource_subtype)
+
+        mem_gb: Optional[int] = None
+        if mem_per_worker_gb is not None:
+            est_total_mem = max(1, int(workers * mem_per_worker_gb + mem_overhead_gb))
+            mem_gb = min(est_total_mem, cap_total_mem_gb) if cap_total_mem_gb is not None else est_total_mem
+
+        return cls(workers=workers, ntasks=ntasks, time=time_str, mem_gb=mem_gb)
+
 
 
 def build_ssh_cmd_squeue(user: str, hostname: str) -> str:
@@ -72,137 +191,69 @@ def build_ssh_cmd_sbatch_hpc(analysis: Analysis, run_location: str):
         raise ValueError(f"No valid run location in build_ssh_cmd_sbatch_hpc, run_loc={run_location}")
 
 
-def build_ssh_cmd_sbatch_hpc_for_cluster(analysis: Analysis, cluster_name: str):
-
-    logging.info(f"Inside build_ssh_cmd_sbatch_hpc_for_cluster: {cluster_name}, id {analysis.sub_id}, sub_type {analysis.sub_type}")
+def build_ssh_cmd_sbatch_hpc_for_cluster(analysis: "Analysis", cluster_name: str) -> str:
+    logging.info(
+        "Inside build_ssh_cmd_sbatch_hpc_for_cluster: %s, id %s, sub_type %s",
+        cluster_name, analysis.sub_id, analysis.sub_type
+    )
 
     cluster_cfg = CONFIG.cluster.get(cluster_name)
     if not cluster_cfg:
         raise Exception(f"cluster config is None for cluster {cluster_name}")
-    resources = cluster_cfg['resources']
-    user = cluster_cfg['user']
-    hostname = cluster_cfg['hostname']
-    account = cluster_cfg['account']
-    appdir = cluster_cfg['appdir']
+
+    resources_cfg = cluster_cfg["resources"]
+    user = cluster_cfg["user"]
+    hostname = cluster_cfg["hostname"]
+    account = cluster_cfg["account"]
+    appdir = cluster_cfg["appdir"]
     max_errors = analysis.max_errors
 
-    # Resource subtype configuration based on sub_type
-    resource_subtype = resources.get(analysis.sub_type, resources['default'])
-    partition = resource_subtype['partition']
+    resource_subtype = resources_cfg.get(analysis.sub_type, resources_cfg["default"])
 
-    # Always use integer ntasks; optional nodes/exclusive flags
-    # Prefer 'ntasks' key, fallback to legacy 'nTasks'
-    ntasks_cfg = int(resource_subtype.get('ntasks', resource_subtype.get('nTasks', 1)))
-    nodes = resource_subtype.get('nodes')  # optional, integer
-    exclusive = bool(resource_subtype.get('exclusive', False))  # optional
-    nodes_opt = f" --nodes={int(nodes)}" if nodes is not None else ""
-    exclusive_opt = " --exclusive" if exclusive else ""
+    partition = resource_subtype["partition"]
+    workers_cfg = int(resource_subtype["workers"])
+    ntasks_cfg = int(resource_subtype.get("ntasks", resource_subtype.get("nTasks", 1)))
+    nodes = resource_subtype.get("nodes")
+    exclusive = bool(resource_subtype.get("exclusive", False))
 
-    mem = resource_subtype.get('mem')
-    workers_cfg = int(resource_subtype['workers'])
-    version = analysis.cellprofiler_version
-
-    # Derive dynamic resources from planned jobs
     n_jobs = count_planned_jobs(analysis)
-    # minutes_per_wave can be configured via 'estimated_job_time' per job type.
-    # If not present, fall back to legacy 'time' value; if neither, default to 60 minutes.
-    def _parse_time_to_minutes(val) -> int | None:
-        """Strictly parse time as H:MM:SS and return total minutes.
 
-        Examples: "0:10:00", "10:00:00". Any other format is rejected.
-        """
-        if val is None:
-            return None
-        try:
-            s = str(val).strip()
-            m = re.match(r"^(\d{1,3}):(\d{2}):(\d{2})$", s)
-            if not m:
-                return None
-            hours = int(m.group(1))
-            mins = int(m.group(2))
-            # seconds are ignored for minutes granularity
-            return hours * 60 + mins
-        except Exception:
-            return None
-
-    # Base estimate from cluster config
-    est_job_time_cfg = resource_subtype.get('estimated_job_time', resource_subtype.get('time'))
-    minutes_per_wave = _parse_time_to_minutes(est_job_time_cfg) or 60
-
-    # Allow per-sub-analysis override via Analysis.estimated_job_time (format H:MM:SS)
-    try:
-        meta_override = analysis.estimated_job_time
-        override_min = _parse_time_to_minutes(meta_override)
-        if override_min is not None:
-            minutes_per_wave = override_min
-    except Exception:
-        # Non-fatal: ignore malformed overrides
-        logging.error("Ignoring invalid meta.estimated_job_time override: %s", analysis.estimated_job_time)
-
-    # Estimated memory per concurrent job (worker), from config or fallback to 'mem'
-    def _parse_mem_gb(mem_str: str | None) -> int | None:
-        try:
-            if not mem_str:
-                return None
-            s = str(mem_str).strip().upper()
-            if s.endswith('GB'):
-                return int(s[:-2])
-            if s.endswith('G'):
-                return int(s[:-1])
-            return int(s)
-        except Exception:
-            return None
-
-    est_job_mem_cfg = resource_subtype.get('estimated_job_mem', resource_subtype.get('mem'))
-    mem_per_job_gb = _parse_mem_gb(est_job_mem_cfg)
-    # Allow per-sub-analysis override via Analysis.estimated_job_mem (e.g., "5GB")
-    try:
-        mem_override = analysis.estimated_job_mem
-        override_mem = _parse_mem_gb(mem_override)
-        if override_mem is not None:
-            mem_per_job_gb = override_mem
-    except Exception:
-        logging.error("Ignoring invalid meta.estimated_job_mem override: %s", analysis.estimated_job_mem)
-
-    dyn = calculate_hpc_resources(
+    resources = DynamicResources.from_analysis_and_subtype(
+        analysis=analysis,
+        resource_subtype=resource_subtype,
         n_jobs=n_jobs,
         workers_cfg=workers_cfg,
-        minutes_per_wave=minutes_per_wave,
-        mem_per_job_gb=mem_per_job_gb,
+        ntasks_cfg=ntasks_cfg,
     )
-    workers = dyn['workers']
-    ntasks = dyn['ntasks'] if dyn['ntasks'] is not None else min(ntasks_cfg, workers)
-    time = dyn['time']
-    # Determine memory: dynamic recommendation from estimated_job_mem per worker,
-    # capped to not exceed configured mem
-    dyn_mem_gb = dyn.get('mem_gb')
-    cfg_mem_gb = _parse_mem_gb(mem)
-    if dyn_mem_gb is not None:
-        final_mem_gb = min(dyn_mem_gb, cfg_mem_gb) if cfg_mem_gb is not None else dyn_mem_gb
-        mem = f"{final_mem_gb}GB"
 
-    ntasks_opt = f" --ntasks {ntasks}"
+    version = analysis.cellprofiler_version
 
+    nodes_opt = f" --nodes={int(nodes)}" if nodes is not None else ""
+    exclusive_opt = " --exclusive" if exclusive else ""
+    mem_opt = f" --mem {resources.mem_gb}GB" if resources.mem_gb is not None else ""
+    version_opt = f" -V {version}" if version else ""
 
-    # Command construction using f-string
-    cmd = (f"ssh -o StrictHostKeyChecking=no {user}@{hostname} sbatch"
-           f" --partition {partition}"
-           f"{ntasks_opt}{nodes_opt}{exclusive_opt}"
-           f" -t {time}"
-           f"{f' --mem {mem}' if mem else ''}"
-           f" --account {account}"
-           f" --job-name=cpp_{analysis.id}_{analysis.sub_id}_{analysis.sub_type}"
-           f" --output=logs/{analysis.sub_id}-{analysis.sub_type}-slurm.%j.out"
-           f" --error=logs/{analysis.sub_id}-{analysis.sub_type}-slurm.%j.out"
-           f" --chdir {appdir}"
-           f" run_cellprofiler_apptainer_pelle.sh"
-           f" -d /cpp_work/input/{analysis.sub_id}"
-           f" -o /cpp_work/output/{analysis.sub_id}"
-           f" -w {workers}"
-           f" -e {max_errors}"
-           f"{f' -V {version}' if version else ''}")
+    cmd = (
+        f"ssh -o StrictHostKeyChecking=no {user}@{hostname} sbatch"
+        f" --partition {partition}"
+        f" --ntasks {resources.ntasks}"
+        f"{nodes_opt}{exclusive_opt}"
+        f" -t {resources.time}"
+        f"{mem_opt}"
+        f" --account {account}"
+        f" --job-name=cpp_{analysis.id}_{analysis.sub_id}_{analysis.sub_type}"
+        f" --output=logs/{analysis.sub_id}-{analysis.sub_type}-slurm.%j.out"
+        f" --error=logs/{analysis.sub_id}-{analysis.sub_type}-slurm.%j.out"
+        f" --chdir {appdir}"
+        f" run_cellprofiler_apptainer_pelle.sh"
+        f" -d /cpp_work/input/{analysis.sub_id}"
+        f" -o /cpp_work/output/{analysis.sub_id}"
+        f" -w {resources.workers}"
+        f" -e {max_errors}"
+        f"{version_opt}"
+    )
 
-    logging.debug(f"cmd: {cmd}")
+    logging.debug("cmd: %s", cmd)
     return cmd
 
 def count_planned_jobs(analysis: Analysis) -> int:
