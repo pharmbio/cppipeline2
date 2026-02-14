@@ -16,23 +16,43 @@ def parse_string_of_num_and_ranges(input_str: str) -> List[int]:
     [2, 3, 4, 5, 7, 12, 15, 16, 17]
     """
     if input_str.startswith("-"):
+        # Single negative (or signed) value; log friendly message and re-raise on error
         try:
             return [int(input_str)]
         except Exception as e:
-            logging.error(f"Error parsing z filter input '{input_str}': {e}")
-            return []
+            msg = (
+                f"Invalid z filter '{input_str}'; expected a single integer "
+                "or comma-separated ranges like '2-5,7,10-12'."
+            )
+            logging.error(msg, exc_info=True)
+            raise ValueError(msg) from e
+
     numbers = set()
-    for element in input_str.split(','):
-        try:
+    try:
+        for element in input_str.split(','):
+            element = element.strip()
+            if not element:
+                continue
             parts = [int(x) for x in element.split('-')]
-        except Exception as e:
-            logging.error(f"Error parsing element '{element}': {e}")
-            continue
-        if len(parts) == 1:
-            numbers.add(parts[0])
-        else:
-            for part in range(min(parts), max(parts) + 1):
-                numbers.add(part)
+            if len(parts) > 2:
+                raise ValueError(
+                    f"Invalid range element '{element}' in z filter '{input_str}' "
+                    "(too many '-' characters)."
+                )
+            if len(parts) == 1:
+                numbers.add(parts[0])
+            else:
+                start, end = parts
+                for part in range(min(start, end), max(start, end) + 1):
+                    numbers.add(part)
+    except Exception as e:
+        msg = (
+            f"Invalid z filter '{input_str}'; expected comma-separated integers "
+            "or ranges like '2-5,7,10-12'."
+        )
+        logging.error(msg, exc_info=True)
+        raise ValueError(msg) from e
+
     return sorted(list(numbers))
 
 # -----------------------------------------------------------------------------

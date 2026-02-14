@@ -12,6 +12,10 @@ from typing import Optional
 from database import Database, Analysis
 from config import CONFIG
 import error_utils
+
+
+_CONSECUTIVE_SACCT_FAILURES = 0
+_SACCT_FAILURE_SLACK_THRESHOLD = 3
 @dataclass(frozen=True)
 class DynamicResources:
     workers: int
@@ -555,9 +559,35 @@ def update_hpc_job_status(cluster: str):
 
     logging.info(f"Inside update_hpc_job_status for cluster={cluster_key}")
 
-    # Build commands and fetch outputs
+    # Build commands and fetch outputs. Sacct/SSH can be flaky, so we only
+    # send Slack alerts if several consecutive calls fail.
     sacct_cmd = build_ssh_cmd_sacct(user, hostname)
-    sacct_output = exec_ssh_cmd(sacct_cmd)
+    global _CONSECUTIVE_SACCT_FAILURES
+    try:
+        sacct_output = exec_ssh_cmd(sacct_cmd)
+        _CONSECUTIVE_SACCT_FAILURES = 0
+    except Exception as e:
+        _CONSECUTIVE_SACCT_FAILURES += 1
+        logging.warning(
+            "update_hpc_job_status: sacct ssh failed (consecutive=%d)",
+            _CONSECUTIVE_SACCT_FAILURES,
+            exc_info=True,
+        )
+        if _CONSECUTIVE_SACCT_FAILURES >= _SACCT_FAILURE_SLACK_THRESHOLD:
+            # Only send Slack after repeated failures
+            error_utils.log_error(
+                title="HPC sacct SSH failed repeatedly",
+                err=e,
+                context={
+                    "cluster": cluster_key,
+                    "consecutive_failures": _CONSECUTIVE_SACCT_FAILURES,
+                    "cmd": sacct_cmd,
+                },
+                also_raise=False,
+            )
+        # Do not crash the server loop on transient HPC failures
+        return
+
     sacct_job_statuses = parse_sacct_output(sacct_output)
 
     # Restrict updates to analyses in need of update on this cluster
