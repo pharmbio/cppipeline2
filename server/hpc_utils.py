@@ -16,6 +16,15 @@ import error_utils
 
 _CONSECUTIVE_SACCT_FAILURES = 0
 _SACCT_FAILURE_SLACK_THRESHOLD = 3
+
+
+def is_terminal_failure_state(state: Optional[str]) -> bool:
+    if state is None:
+        return False
+    normalized = state.strip().upper()
+    return normalized.startswith("FAILED") or normalized.startswith("TIMEOUT")
+
+
 @dataclass(frozen=True)
 class DynamicResources:
     workers: int
@@ -506,6 +515,39 @@ def update_job_status_in_db(job_statuses: list[dict], db: 'Database'):
 
                 # Execute the update query for parent analysis
                 cursor.execute(query_parent, [status_json, analysis_id])
+
+                # If sacct reports a terminal failure/timeout, mark the analysis as errored.
+                if is_terminal_failure_state(state):
+                    try:
+                        # Mark parent analysis as errored
+                        db.set_analysis_error(
+                            analysis_id,
+                            f"HPC sacct state {state} for job {job_id}",
+                        )
+
+                        # Also mark the sub-analysis, if we have its id
+                        if sub_id is not None:
+                            try:
+                                sub_id_int = int(sub_id)
+                                analysis_obj = db.get_analysis(sub_id_int)
+                                if analysis_obj is not None:
+                                    db.set_sub_analysis_error(
+                                        analysis_obj,
+                                        f"HPC sacct state {state} for job {job_id}",
+                                    )
+                            except Exception:
+                                logging.error(
+                                    "Failed to mark sub-analysis error for sacct state; sub_id=%s",
+                                    sub_id,
+                                    exc_info=True,
+                                )
+                    except Exception:
+                        logging.error(
+                            "Failed to mark analysis %s as error for sacct state %s",
+                            analysis_id,
+                            state,
+                            exc_info=True,
+                        )
 
                 # 2) Update sub-analysis row, if we have a sub_id
                 if sub_id is not None:
