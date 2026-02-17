@@ -348,6 +348,7 @@ def fetch_finished_subanalyses_hpc(cluster: str) -> Dict[int, List[Dict[str, Any
                 "FROM image_sub_analyses "
                 "WHERE finish IS NULL "
                 "  AND error IS NULL "
+                "  AND start IS NOT NULL "
                 "  AND (meta->>'run_location') = %s "
                 "ORDER BY sub_id"
             )
@@ -362,8 +363,8 @@ def fetch_finished_subanalyses_hpc(cluster: str) -> Dict[int, List[Dict[str, Any
         if conn:
             db.release_connection(conn)
 
-    # Per-sub_id processing: compute finished lists and totals via helper, update progress, and emit finished per sub_id
-    finished_by_sub: dict[int, list[dict]] = {}
+    # Per-sub_id processing: compute finished lists and totals, update progress, and emit finished per sub_id
+    finished_by_sub: Dict[int, List[Dict[str, Any]]] = {}
     for sub in unfinished_subs:
         sub_id = sub["sub_id"]
         analysis = Database.get_instance().get_analysis(sub_id)
@@ -401,24 +402,41 @@ def fetch_finished_subanalyses_hpc(cluster: str) -> Dict[int, List[Dict[str, Any
             # If checking fails, proceed without crashing the loop
             logging.debug("Failed checking top-level error marker for sub_id=%s", analysis.sub_id)
 
-        # Second: Get all finished jobs that did NOT error out
-        finished_list, total_jobs = get_list_of_finished_jobs(
-            analysis,
-            finished_only=True,
-            exclude_errors=True,
-        )
-        successful_jobs = len(finished_list)
-
-        # Third: Count jobs that have an error marker
+        # Second: Single pass over job dirs to determine finished and errored jobs
+        finished_list: List[Dict[str, Any]] = []
+        total_jobs: Optional[int] = None
         error_jobs = 0
         try:
             job_dirs = _list_subdirs(analysis.sub_output_dir)
             for jd in job_dirs:
                 job_path = os.path.join(analysis.sub_output_dir, jd)
-                if os.path.exists(os.path.join(job_path, "error")):
+                jobname = JobName.parse_folder_name(jd)
+                if jobname and jobname.sub_id == analysis.sub_id and total_jobs is None:
+                    total_jobs = jobname.n_jobs
+                    analysis_id = jobname.analysis_id
+                else:
+                    analysis_id = analysis.id
+
+                has_error = os.path.exists(os.path.join(job_path, "error"))
+                if has_error:
                     error_jobs += 1
+                    continue
+
+                has_finished = os.path.exists(os.path.join(job_path, "finished"))
+                if not has_finished:
+                    continue
+
+                finished_list.append({
+                    "metadata": {
+                        "name": jd,
+                        "sub_id": analysis.sub_id,
+                        "analysis_id": analysis_id,
+                    }
+                })
         except Exception:
             logging.debug("Failed listing job dirs for sub_id=%s", analysis.sub_id)
+
+        successful_jobs = len(finished_list)
 
         # Treat both finished and errored jobs as contributing to "done" count;
         # max_errors is not used in the completion logic here.
