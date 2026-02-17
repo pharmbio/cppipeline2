@@ -580,6 +580,19 @@ def prepare_analysis_cellprofiler_hpc(analysis: Analysis):
         if not imgset_batches:
             raise ValueError(f"No image sets found for sub_id {analysis.sub_id}")
 
+        # If there are no image sets at all (which would produce empty CSVs),
+        # treat this as an analysis error with a clear message.
+        total_imgsets = sum(len(batch) for batch in imgset_batches)
+        if total_imgsets == 0:
+            msg = "No images found for this combination of wells, sites, zplanes, plate-acq-id etc"
+            logging.error(
+                "%s; sub_id=%s analysis_id=%s",
+                msg,
+                analysis.sub_id,
+                analysis.id,
+            )
+            raise ValueError(msg)
+
         channel_map = analysis.get_channelmap()
         logging.debug(f"channelmap: {channel_map}")
 
