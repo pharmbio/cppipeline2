@@ -35,11 +35,90 @@ import error_utils
 
 ## JobName helpers are now provided by job_utils.JobName; no wrappers needed here.
 
+# Cache of per-sub-analysis job dir states to avoid
+# re-checking finished/errored jobs on every scan.
+_JOB_SCAN_CACHE = {}
+
 def _list_subdirs(path: str) -> List[str]:
     try:
         return [d.name for d in os.scandir(path) if d.is_dir()]
     except FileNotFoundError:
         return []
+
+
+def _scan_sub_jobs(analysis: Analysis) -> Tuple[List[Dict[str, Any]], Optional[int], int, int]:
+    """
+    Scan job directories for a single sub-analysis and return:
+    - finished_list: list of finished job metadata dicts
+    - total_jobs: expected number of jobs (if derivable from folder names)
+    - successful_jobs: count of finished jobs
+    - error_jobs: count of errored jobs
+
+    Uses an in-memory cache so that finished/errored jobs are not re-checked
+    on every iteration.
+    """
+    # Initialise / fetch per-sub cache
+    cache = _JOB_SCAN_CACHE.get(analysis.sub_id)
+    if cache is None:
+        cache = {"finished": set(), "error": set()}
+        _JOB_SCAN_CACHE[analysis.sub_id] = cache
+    cached_finished = cache["finished"]
+    cached_error = cache["error"]
+
+    total_jobs: Optional[int] = None
+
+    try:
+        scan_start = time.time()
+        job_dirs = _list_subdirs(analysis.sub_output_dir)
+        for jd in job_dirs:
+            job_path = os.path.join(analysis.sub_output_dir, jd)
+            jobname = JobName.parse_folder_name(jd)
+            if jobname and jobname.sub_id == analysis.sub_id and total_jobs is None:
+                total_jobs = jobname.n_jobs
+
+            # Skip dirs already classified
+            if jd in cached_finished or jd in cached_error:
+                continue
+
+            if os.path.exists(os.path.join(job_path, "error")):
+                cached_error.add(jd)
+                continue
+
+            if os.path.exists(os.path.join(job_path, "finished")):
+                cached_finished.add(jd)
+
+        scan_elapsed = time.time() - scan_start
+        logging.debug(
+            "Job dir scan for sub_id=%s took %.3fs (job_dirs=%d, finished=%d, error=%d)",
+            analysis.sub_id,
+            scan_elapsed,
+            len(job_dirs),
+            len(cached_finished),
+            len(cached_error),
+        )
+    except Exception:
+        logging.debug("Failed listing job dirs for sub_id=%s", analysis.sub_id)
+        return [], None, 0, 0
+
+    # Build finished job metadata from cached finished dirs
+    finished_list: List[Dict[str, Any]] = []
+    for jd in sorted(cached_finished):
+        jobname = JobName.parse_folder_name(jd)
+        if jobname and jobname.sub_id == analysis.sub_id:
+            analysis_id = jobname.analysis_id
+        else:
+            analysis_id = analysis.id
+        finished_list.append({
+            "metadata": {
+                "name": jd,
+                "sub_id": analysis.sub_id,
+                "analysis_id": analysis_id,
+            }
+        })
+
+    successful_jobs = len(cached_finished)
+    error_jobs = len(cached_error)
+    return finished_list, total_jobs, successful_jobs, error_jobs
 
 def _parse_elapsed_to_timedelta(elapsed_str: str) -> Optional[datetime.timedelta]:
     """
@@ -396,47 +475,15 @@ def fetch_finished_subanalyses_hpc(cluster: str) -> Dict[int, List[Dict[str, Any
                     + (f": {original_err}" if original_err else "")
                 )
                 Database.get_instance().set_sub_analysis_error(analysis, msg)
+                _JOB_SCAN_CACHE.pop(analysis.sub_id, None)
                 # Skip further processing for this sub-analysis in this cycle
                 continue
         except Exception:
             # If checking fails, proceed without crashing the loop
             logging.debug("Failed checking top-level error marker for sub_id=%s", analysis.sub_id)
 
-        # Second: Single pass over job dirs to determine finished and errored jobs
-        finished_list: List[Dict[str, Any]] = []
-        total_jobs: Optional[int] = None
-        error_jobs = 0
-        try:
-            job_dirs = _list_subdirs(analysis.sub_output_dir)
-            for jd in job_dirs:
-                job_path = os.path.join(analysis.sub_output_dir, jd)
-                jobname = JobName.parse_folder_name(jd)
-                if jobname and jobname.sub_id == analysis.sub_id and total_jobs is None:
-                    total_jobs = jobname.n_jobs
-                    analysis_id = jobname.analysis_id
-                else:
-                    analysis_id = analysis.id
-
-                has_error = os.path.exists(os.path.join(job_path, "error"))
-                if has_error:
-                    error_jobs += 1
-                    continue
-
-                has_finished = os.path.exists(os.path.join(job_path, "finished"))
-                if not has_finished:
-                    continue
-
-                finished_list.append({
-                    "metadata": {
-                        "name": jd,
-                        "sub_id": analysis.sub_id,
-                        "analysis_id": analysis_id,
-                    }
-                })
-        except Exception:
-            logging.debug("Failed listing job dirs for sub_id=%s", analysis.sub_id)
-
-        successful_jobs = len(finished_list)
+        # Second: scan job dirs (with caching) to determine finished and errored jobs
+        finished_list, total_jobs, successful_jobs, error_jobs = _scan_sub_jobs(analysis)
 
         # Treat both finished and errored jobs as contributing to "done" count;
         # max_errors is not used in the completion logic here.
@@ -467,6 +514,7 @@ def fetch_finished_subanalyses_hpc(cluster: str) -> Dict[int, List[Dict[str, Any
                     analysis.id,
                 )
                 Database.get_instance().set_sub_analysis_error(analysis, msg)
+                _JOB_SCAN_CACHE.pop(analysis.sub_id, None)
                 # Skip finished-marker handling for this sub in this cycle
                 continue
         except Exception:
@@ -482,6 +530,7 @@ def fetch_finished_subanalyses_hpc(cluster: str) -> Dict[int, List[Dict[str, Any
             finished_marker = os.path.join(analysis.sub_output_dir, "finished")
             if os.path.exists(finished_marker):
                 finished_by_sub[analysis.sub_id] = finished_list
+                _JOB_SCAN_CACHE.pop(analysis.sub_id, None)
         except Exception:
             logging.warning("Failed checking top-level finished marker for sub_id=%s", analysis.sub_id)
 
