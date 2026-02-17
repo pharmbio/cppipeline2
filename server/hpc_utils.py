@@ -23,7 +23,12 @@ def is_terminal_failure_state(state: Optional[str]) -> bool:
     if state is None:
         return False
     normalized = state.strip().upper()
-    return normalized.startswith("FAILED") or normalized.startswith("TIMEOUT")
+    # Treat FAILED*, TIMEOUT*, and NODE_FAIL* as terminal failures.
+    return (
+        normalized.startswith("FAILED")
+        or normalized.startswith("TIMEOUT")
+        or normalized.startswith("NODE_FAIL")
+    )
 
 
 @dataclass(frozen=True)
