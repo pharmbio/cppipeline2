@@ -6,6 +6,7 @@ import re
 import os
 import glob
 import math
+import time
 
 from dataclasses import dataclass
 from typing import Optional
@@ -162,7 +163,7 @@ def build_ssh_cmd_sacct(user: str, hostname: str) -> str:
     logging.info(f"Building SSH command for sacct")
 
     # Calculate start time (10 days ago) for historical job data retrieval
-    start_time = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
+    start_time = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
 
     # Include JobName in the sacct output format
     # The format order: JobID,JobName,State,Elapsed
@@ -438,9 +439,14 @@ def parse_sacct_output(output: str) -> list[dict]:
     # Regex for extracting analysis_id and sub_id from job name
     name_pattern = re.compile(r"cpp_(\d+)_(\d+)_")
 
+    lines = output.splitlines()
+    total_lines = len(lines)
+    skipped_steps = 0
+    unmatched_names = 0
+
     # Expected sacct format: JobID, JobName (width extended), State, Elapsed
     # The header line might look like: "JobID JobName State Elapsed ..."
-    for line in output.splitlines()[1:]:  # Skip the header
+    for line in lines[1:]:  # Skip the header
         parts = line.split()
         # We expect at least 4 parts: JobID, JobName, State, Elapsed
         if len(parts) >= 4:
@@ -452,6 +458,7 @@ def parse_sacct_output(output: str) -> list[dict]:
 
             # Skip if job_id contains a dot, indicating a job step (e.g., .batch, .extern)
             if '.' in job_id:
+                skipped_steps += 1
                 continue
 
             # Check if job_name matches the cpp pattern
@@ -467,8 +474,16 @@ def parse_sacct_output(output: str) -> list[dict]:
                 })
             else:
                 # JobName does not match the expected pattern, skip it
+                unmatched_names += 1
                 logging.debug(f"Skipping job with unmatched name: {job_name}")
 
+    logging.debug(
+        "parse_sacct_output: total_lines=%d, primary_jobs=%d, skipped_steps=%d, unmatched_names=%d",
+        total_lines,
+        len(job_statuses),
+        skipped_steps,
+        unmatched_names,
+    )
     return job_statuses
 
 
@@ -514,40 +529,94 @@ def update_job_status_in_db(job_statuses: list[dict], db: 'Database'):
                 logging.debug(f"Executing parent status update query: {query_parent_with_params}")
 
                 # Execute the update query for parent analysis
+                parent_start = time.time()
                 cursor.execute(query_parent, [status_json, analysis_id])
+                parent_elapsed = time.time() - parent_start
+                logging.debug(
+                    "Parent status UPDATE for analysis_id=%s completed in %.3fs (rowcount=%s)",
+                    analysis_id,
+                    parent_elapsed,
+                    getattr(cursor, "rowcount", "n/a"),
+                )
 
-                # If sacct reports a terminal failure/timeout, mark the analysis as errored.
+                # If sacct reports a terminal failure/timeout, mark the analysis and sub-analysis as errored.
                 if is_terminal_failure_state(state):
-                    try:
-                        # Mark parent analysis as errored
-                        db.set_analysis_error(
-                            analysis_id,
-                            f"HPC sacct state {state} for job {job_id}",
-                        )
+                    err_msg = f"HPC sacct state {state} for job {job_id}"
+                    logging.debug(
+                        "Marking analysis_id=%s (sub_id=%s) as ERROR due to sacct state %s",
+                        analysis_id,
+                        sub_id,
+                        state,
+                    )
 
-                        # Also mark the sub-analysis, if we have its id
-                        if sub_id is not None:
-                            try:
-                                sub_id_int = int(sub_id)
-                                analysis_obj = db.get_analysis(sub_id_int)
-                                if analysis_obj is not None:
-                                    db.set_sub_analysis_error(
-                                        analysis_obj,
-                                        f"HPC sacct state {state} for job {job_id}",
-                                    )
-                            except Exception:
-                                logging.error(
-                                    "Failed to mark sub-analysis error for sacct state; sub_id=%s",
-                                    sub_id,
-                                    exc_info=True,
-                                )
-                    except Exception:
-                        logging.error(
-                            "Failed to mark analysis %s as error for sacct state %s",
-                            analysis_id,
-                            state,
-                            exc_info=True,
-                        )
+                    # Parent analysis: set error timestamp and attach error_message into result + status
+                    result_patch = json.dumps({"error_message": err_msg[:500]})
+                    cursor.execute(
+                        """
+                        UPDATE image_analyses
+                           SET error = NOW(),
+                               result = COALESCE(result, '{}'::jsonb) || %s::jsonb
+                         WHERE id = %s
+                        """,
+                        [result_patch, analysis_id],
+                    )
+                    parent_status_patch = json.dumps({
+                        "state": "ERROR",
+                        "error_message": err_msg[:200],
+                    })
+                    cursor.execute(
+                        """
+                        UPDATE image_analyses
+                           SET status = COALESCE(status, '{}'::jsonb) || %s::jsonb
+                         WHERE id = %s
+                        """,
+                        [parent_status_patch, analysis_id],
+                    )
+
+                    # Sub-analysis: if we know sub_id, mark sub row as errored and
+                    # add a concise error key on the parent status.
+                    if sub_id is not None:
+                        try:
+                            sub_id_int = int(sub_id)
+                            sub_result_patch = json.dumps({"error_message": err_msg[:500]})
+                            cursor.execute(
+                                """
+                                UPDATE image_sub_analyses
+                                   SET error = NOW(),
+                                       result = COALESCE(result, '{}'::jsonb) || %s::jsonb
+                                 WHERE sub_id = %s
+                                """,
+                                [sub_result_patch, sub_id_int],
+                            )
+                            sub_status_patch = json.dumps({
+                                "state": "ERROR",
+                                "error_message": err_msg[:200],
+                            })
+                            cursor.execute(
+                                """
+                                UPDATE image_sub_analyses
+                                   SET status = COALESCE(status, '{}'::jsonb) || %s::jsonb
+                                 WHERE sub_id = %s
+                                """,
+                                [sub_status_patch, sub_id_int],
+                            )
+                            parent_error_key_patch = json.dumps({
+                                f"error_{sub_id_int}": err_msg[:200],
+                            })
+                            cursor.execute(
+                                """
+                                UPDATE image_analyses
+                                   SET status = COALESCE(status, '{}'::jsonb) || %s::jsonb
+                                 WHERE id = %s
+                                """,
+                                [parent_error_key_patch, analysis_id],
+                            )
+                        except Exception:
+                            logging.error(
+                                "Failed to mark sub-analysis error for sacct state; sub_id=%s",
+                                sub_id,
+                                exc_info=True,
+                            )
 
                 # 2) Update sub-analysis row, if we have a sub_id
                 if sub_id is not None:
@@ -556,15 +625,30 @@ def update_job_status_in_db(job_statuses: list[dict], db: 'Database'):
                         query_sub = """
                             UPDATE image_sub_analyses
                                SET status = COALESCE(status, '{}'::jsonb) || %s::jsonb
-                             WHERE sub_id = %s
+                               WHERE sub_id = %s
                         """
                         query_sub_with_params = cursor.mogrify(query_sub, [status_json, sub_id_int]).decode('utf-8')
                         logging.debug(f"Executing sub-analysis status update query: {query_sub_with_params}")
+                        sub_start = time.time()
                         cursor.execute(query_sub, [status_json, sub_id_int])
+                        sub_elapsed = time.time() - sub_start
+                        logging.debug(
+                            "Sub-analysis status UPDATE for sub_id=%s completed in %.3fs (rowcount=%s)",
+                            sub_id_int,
+                            sub_elapsed,
+                            getattr(cursor, "rowcount", "n/a"),
+                        )
                     except Exception:
                         logging.error("Failed to update sub-analysis status; sub_id=%s", sub_id, exc_info=True)
 
+                commit_start = time.time()
                 conn.commit()
+                commit_elapsed = time.time() - commit_start
+                logging.debug(
+                    "update_job_status_in_db: COMMIT for analysis_id=%s completed in %.3fs",
+                    analysis_id,
+                    commit_elapsed,
+                )
 
                 logging.debug(f"Successfully updated job {job_id} with state {state}")
         except Exception as e:
@@ -606,7 +690,12 @@ def update_hpc_job_status(cluster: str):
     sacct_cmd = build_ssh_cmd_sacct(user, hostname)
     global _CONSECUTIVE_SACCT_FAILURES
     try:
+        logging.debug("update_hpc_job_status: starting sacct ssh call")
         sacct_output = exec_ssh_cmd(sacct_cmd)
+        logging.debug(
+            "update_hpc_job_status: sacct ssh completed; output size=%d bytes",
+            len(sacct_output) if isinstance(sacct_output, str) else -1,
+        )
         _CONSECUTIVE_SACCT_FAILURES = 0
     except Exception as e:
         _CONSECUTIVE_SACCT_FAILURES += 1
@@ -631,6 +720,11 @@ def update_hpc_job_status(cluster: str):
         return
 
     sacct_job_statuses = parse_sacct_output(sacct_output)
+    logging.info(
+        "update_hpc_job_status: parsed %d sacct job rows for cluster=%s",
+        len(sacct_job_statuses),
+        cluster_key,
+    )
 
     # Restrict updates to analyses in need of update on this cluster
     db = Database.get_instance()
@@ -668,8 +762,14 @@ def update_hpc_job_status(cluster: str):
         return
 
     filtered_statuses = [js for js in sacct_job_statuses if int(js.get('analysis_id', -1)) in allowed_ids]
+    logging.info(
+        "update_hpc_job_status: %d sacct rows, %d active analyses, %d rows match",
+        len(sacct_job_statuses),
+        len(allowed_ids),
+        len(filtered_statuses),
+    )
     if not filtered_statuses:
-        logging.info(f"No matching job statuses for {cluster_key} among {len(sacct_job_statuses)} entries")
+        logging.info(f"No matching job statuses for {cluster_key}; nothing to update in DB")
         return
 
     update_job_status_in_db(filtered_statuses, db)

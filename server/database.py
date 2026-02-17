@@ -157,7 +157,14 @@ class Database:
     def get_connection(self):
         if self.connection_pool is None:
             raise Exception("Connection pool has not been initialized.")
-        return self.connection_pool.getconn()
+        conn = self.connection_pool.getconn()
+        # Set a global statement timeout for all queries on this connection.
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET statement_timeout = '10s'")
+        except Exception as e:
+            logging.error("Failed setting statement_timeout on connection: %s", e)
+        return conn
 
     def release_connection(self, conn):
         if self.connection_pool is not None:
