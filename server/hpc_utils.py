@@ -167,8 +167,8 @@ def build_ssh_cmd_sacct(user: str, hostname: str) -> str:
     """
     logging.info(f"Building SSH command for sacct")
 
-    # Calculate start time (10 days ago) for historical job data retrieval
-    start_time = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+    # Calculate start time (X days ago) for historical job data retrieval
+    start_time = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
 
     # Include JobName in the sacct output format
     # The format order: JobID,JobName,State,Elapsed

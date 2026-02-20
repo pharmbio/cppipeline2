@@ -196,7 +196,7 @@ def _get_sub_analysis_start(sub_id: int) -> Optional[datetime.datetime]:
         if conn:
             db.release_connection(conn)
 
-def _update_progress(analysis_id: int, sub_id: int, done: int, total: int) -> None:
+def _update_progress(analysis_id: int, sub_id: int, done: int, total: int, error_jobs: int = 0) -> None:
     if total <= 0:
         return
     # Estimate remaining time if we have at least one finished job
@@ -225,7 +225,19 @@ def _update_progress(analysis_id: int, sub_id: int, done: int, total: int) -> No
                 progress_str = f"{progress_str}, time remaining: {hours_remain:.2f} hours"
             except Exception:
                 pass
-    Database.get_instance().set_status(analysis_id, sub_id, "progress", progress_str)
+    db = Database.get_instance()
+    db.set_status(analysis_id, sub_id, "progress", progress_str)
+    # Also expose error_jobs in status when there are job-level errors.
+    try:
+        if error_jobs > 0:
+            db.set_status(analysis_id, sub_id, "error_jobs", str(error_jobs))
+    except Exception:
+        logging.error(
+            "Failed updating error_count in status; analysis_id=%s sub_id=%s",
+            analysis_id,
+            sub_id,
+            exc_info=True,
+        )
 
 
 ## get_job_list moved to job_utils.py
@@ -490,7 +502,13 @@ def fetch_finished_subanalyses_hpc(cluster: str) -> Dict[int, List[Dict[str, Any
         effective_done = successful_jobs + error_jobs
 
         if total_jobs is not None:
-            _update_progress(analysis.id, analysis.sub_id, effective_done, total_jobs or 0)
+            _update_progress(
+                analysis.id,
+                analysis.sub_id,
+                effective_done,
+                total_jobs or 0,
+                error_jobs=error_jobs,
+            )
 
         # If we have seen all expected jobs for this sub-analysis and *all*
         # of them ended in error (i.e. there are no successfully finished jobs),

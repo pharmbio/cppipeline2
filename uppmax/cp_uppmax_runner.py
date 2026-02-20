@@ -687,6 +687,7 @@ def run_all_commands_via_threadpool(
         logging.info("Limiting to first %d commands for testing", len(cmds))
 
     start_time = time.time()
+    total_cmds = len(cmds)
 
     remaining_cmds = list(cmds)
     finished = errors = 0
@@ -740,6 +741,12 @@ def run_all_commands_via_threadpool(
 
     if errors > cfg.max_errors:
         raise Exception(f"More errors than max_errors: {errors} > {cfg.max_errors}")
+
+    # Sanity check: make sure we accounted for all commands.
+    if finished + errors != total_cmds:
+        raise RuntimeError(
+            f"Command accounting mismatch: total={total_cmds}, finished={finished}, errors={errors}"
+        )
 
 def setup_logging(level=logging.INFO, log_path: Optional[str] = None):
     formatter = logging.Formatter(
