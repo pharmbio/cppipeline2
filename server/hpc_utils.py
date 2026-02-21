@@ -492,6 +492,35 @@ def parse_sacct_output(output: str) -> list[dict]:
     return job_statuses
 
 
+def keep_latest_sacct_row_per_sub_id(job_statuses: list[dict]) -> list[dict]:
+    """
+    Deduplicate sacct rows by sub_id and keep only the latest row per sub_id.
+
+    Sacct output order is trusted; later rows are treated as more recent.
+    """
+    latest_by_sub: dict[str, dict] = {}
+    passthrough_rows: list[dict] = []
+
+    for row in job_statuses:
+        sub_id = row.get("sub_id")
+        if sub_id is None:
+            passthrough_rows.append(row)
+            continue
+
+        latest_by_sub[str(sub_id)] = row
+
+    deduped_rows = list(latest_by_sub.values())
+    if passthrough_rows:
+        deduped_rows.extend(passthrough_rows)
+
+    logging.info(
+        "keep_latest_sacct_row_per_sub_id: input=%d deduped=%d",
+        len(job_statuses),
+        len(deduped_rows),
+    )
+    return deduped_rows
+
+
 def update_job_status_in_db(job_statuses: list[dict], db: 'Database'):
     """
     Updates the job statuses in the database by using the analysis_id as the key.
@@ -777,7 +806,16 @@ def update_hpc_job_status(cluster: str):
         logging.info(f"No matching job statuses for {cluster_key}; nothing to update in DB")
         return
 
-    update_job_status_in_db(filtered_statuses, db)
+    latest_statuses = keep_latest_sacct_row_per_sub_id(filtered_statuses)
+    logging.info(
+        "update_hpc_job_status: %d rows after latest-per-sub_id dedupe",
+        len(latest_statuses),
+    )
+    if not latest_statuses:
+        logging.info(f"No deduped job statuses for {cluster_key}; nothing to update in DB")
+        return
+
+    update_job_status_in_db(latest_statuses, db)
 
 
 def get_cellprofiler_cmd_hpc(pipeline_file: str, imageset_file: str, output_path: str, job_timeout: int) -> str:
