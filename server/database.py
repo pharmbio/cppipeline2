@@ -845,29 +845,34 @@ class Analysis:
         for set_id, img_set in img_sets.items():
             logging.debug(f"ImageSet {set_id} has {len(img_set.all_images)} images")
 
-        # Consistency check: all image sets must have the same number of images.
-        # This helps detect missing per-channel images or other incompleteness.
-        if img_sets:
-            lengths = {set_id: len(img_set.all_images) for set_id, img_set in img_sets.items()}
-            unique_lengths = set(lengths.values())
-            if len(unique_lengths) > 1:
-                details = ", ".join(f"{sid}={ln}" for sid, ln in lengths.items())
-                msg = (
-                    f"Inconsistent image set sizes for analysis_id={self.id}, sub_id={self.sub_id}; "
-                    f"expected all sets to have same number of images. "
-                    f"Lengths: {details}"
-                )
-                logging.error(msg)
-                try:
-                    Database.get_instance().set_sub_analysis_error(self, msg)
-                except Exception:
-                    logging.error(
-                        "Failed setting sub-analysis error for inconsistent image set sizes",
-                        exc_info=True,
-                    )
-                raise ValueError(msg)
-
         return img_sets
+
+    def verify_imgset_consistency(self, img_sets: Dict[str, ImageSet]) -> None:
+        if not img_sets:
+            return
+
+        lengths = {set_id: len(img_set.all_images) for set_id, img_set in img_sets.items()}
+        unique_lengths = set(lengths.values())
+        if len(unique_lengths) <= 1:
+            return
+
+        sorted_by_len = sorted(lengths.items(), key=lambda item: (item[1], item[0]))
+        min_set_id, min_len = sorted_by_len[0]
+        max_set_id, max_len = sorted_by_len[-1]
+        msg = (
+            f"Inconsistent image set sizes for analysis_id={self.id}, sub_id={self.sub_id}. "
+            f"Example mismatch: {min_set_id}={min_len} images vs {max_set_id}={max_len} images. "
+            "All image sets must have the same number of images."
+        )
+        logging.error(msg)
+        try:
+            Database.get_instance().set_sub_analysis_error(self, msg)
+        except Exception:
+            logging.error(
+                "Failed setting sub-analysis error for inconsistent image set sizes",
+                exc_info=True,
+            )
+        raise ValueError(msg)
 
     def get_imgset_batches(self, batch_size: Optional[int] = None) -> List[List[ImageSet]]:
         """
@@ -883,6 +888,7 @@ class Analysis:
         if batch_size is None:
             batch_size = self.batch_size
         imgset_dict = self.get_all_imgsets()
+        self.verify_imgset_consistency(imgset_dict)
         imgset_list = list(imgset_dict.values())
         if batch_size == -1:
             logging.info("Batch size is -1; returning a single batch with all image sets.")
