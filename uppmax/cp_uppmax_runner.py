@@ -531,14 +531,20 @@ def get_bucket_name(project: str) -> str:
 def get_project_from_path(local_path: str) -> str:
     """
     Extract project name from a filesystem path.
-    Assumes layout: /share/mikro3/squid/<project>/...
-    i.e. project is the 4th non-empty component from the root.
+
+    Special case: paths under /share/mikro/IMX/<org>/<project>/... use the 5th part.
+    Fallback: 4th non-empty path segment.
     """
     norm = os.path.normpath(local_path)
     parts = [p for p in norm.split(os.sep) if p]
-    if len(parts) < 4:
+
+    # Special case for IMX data layout
+    if len(parts) >= 5 and parts[0:3] == ["share", "mikro", "IMX"]:
+        return parts[4]
+    elif len(parts) >= 4:
+        return parts[3]
+    else:
         raise ValueError(f"Cannot extract project from path (too few components): {local_path}")
-    return parts[3]
 
 
 def get_bucket_from_path(path: str) -> str:
