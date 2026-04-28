@@ -780,6 +780,23 @@ class Analysis:
         return None
 
     @property
+    def time(self) -> Optional[str]:
+        """
+        Optional total sbatch walltime cap override.
+
+        Prefer meta['time'] so pipeline metadata can control Slurm walltime.
+        Fall back to a top-level 'time' field if present in the analysis row.
+        Expected as string in H:MM:SS format (e.g., "6:00:00").
+        """
+        analysis_meta = self.meta
+        if isinstance(analysis_meta, dict) and 'time' in analysis_meta:
+            val = analysis_meta.get('time')
+            return str(val) if val is not None else None
+
+        val = self._data.get('time')
+        return str(val) if val is not None else None
+
+    @property
     def estimated_job_mem(self) -> Optional[str]:
         """
         Optional per-sub-analysis estimated memory per job override from meta.
@@ -847,6 +864,33 @@ class Analysis:
 
         return img_sets
 
+    def verify_first_imgset_has_requested_channels(self, img_sets: Dict[str, ImageSet]) -> None:
+        requested_channels = self.channels_filter()
+        if not requested_channels or not img_sets:
+            return
+
+        first_set_id = next(iter(img_sets))
+        first_imgset = img_sets[first_set_id]
+        available_channels = {img.dye for img in first_imgset.all_images}
+        missing = [channel for channel in requested_channels if channel not in available_channels]
+        if not missing:
+            return
+
+        msg = (
+            f"Missing required channels for analysis_id={self.id}, sub_id={self.sub_id}. "
+            f"First image set {first_set_id} is missing: {', '.join(str(ch) for ch in missing)}. "
+            "All channels specified in meta['channels'] must be available."
+        )
+        logging.error(msg)
+        try:
+            Database.get_instance().set_sub_analysis_error(self, msg)
+        except Exception:
+            logging.error(
+                "Failed setting sub-analysis error for missing required channels in first image set",
+                exc_info=True,
+            )
+        raise ValueError(msg)
+
     def verify_imgset_consistency(self, img_sets: Dict[str, ImageSet]) -> None:
         if not img_sets:
             return
@@ -888,6 +932,7 @@ class Analysis:
         if batch_size is None:
             batch_size = self.batch_size
         imgset_dict = self.get_all_imgsets()
+        self.verify_first_imgset_has_requested_channels(imgset_dict)
         self.verify_imgset_consistency(imgset_dict)
         imgset_list = list(imgset_dict.values())
         if batch_size == -1:
