@@ -376,7 +376,7 @@ def exec_ssh_cmd(cmd: str) -> str:
         logging.debug(f"Command output:\n{output}")
         return output
     except subprocess.CalledProcessError as e:
-        logging.error("exec_ssh_cmd failed; cmd=%s", cmd, exc_info=True)
+        logging.warn("exec_ssh_cmd failed; cmd=%s", cmd, exc_info=True)
         raise
 
 
