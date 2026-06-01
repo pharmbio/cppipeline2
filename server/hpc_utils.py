@@ -187,13 +187,13 @@ def build_ssh_cmd_sbatch_hpc(analysis: Analysis, run_location: str):
     - use explicit run_location argument if provided
     - else use analysis.run_location property if available
 
-    Supported locations include 'pelle', 'rackham', 'uppmax', 'hpc_dev', 'farmbio'.
+    Supported locations include 'pelle', 'rackham', 'uppmax', 'hpc_dev', 'pharmbio'.
     Currently mapped as:
     - 'pelle' -> pelle builder
     - 'rackham' -> rackham builder
     - 'hpc_dev' -> pelle builder (legacy dev cluster)
     - 'uppmax' -> pelle builder (adjust if you add a separate mapping)
-    - 'farmbio' -> raise NotImplementedError until defined
+    - 'pharmbio' -> raise NotImplementedError until defined
     """
     if run_location == 'rackham':
         return build_ssh_cmd_sbatch_rackham(analysis)
@@ -204,8 +204,8 @@ def build_ssh_cmd_sbatch_hpc(analysis: Analysis, run_location: str):
     elif run_location == 'uppmax':
         # Currently map uppmax jobs onto the pelle cluster configuration.
         return build_ssh_cmd_sbatch_hpc_for_cluster(analysis, 'pelle')
-    elif run_location == 'farmbio':
-        raise NotImplementedError("run_location 'farmbio' mapping not implemented in build_ssh_cmd_sbatch_hpc")
+    elif run_location == 'pharmbio':
+        raise NotImplementedError("run_location 'pharmbio' mapping not implemented in build_ssh_cmd_sbatch_hpc")
     else:
         raise ValueError(f"No valid run location in build_ssh_cmd_sbatch_hpc, run_loc={run_location}")
 
@@ -818,7 +818,7 @@ def update_hpc_job_status(cluster: str):
     update_job_status_in_db(latest_statuses, db)
 
 
-def get_cellprofiler_cmd_hpc(pipeline_file: str, imageset_file: str, output_path: str, job_timeout: int) -> str:
+def get_cellprofiler_cmd_hpc(pipeline_file: str, imageset_file: str, output_path: str, job_timeout: int, plugins_dir: str) -> str:
 
     cmd = (f' timeout {job_timeout}'
            f' cellprofiler'
@@ -827,6 +827,6 @@ def get_cellprofiler_cmd_hpc(pipeline_file: str, imageset_file: str, output_path
            f' -p {pipeline_file}'
            f' --data-file {imageset_file}'
            f' -o {output_path}'
-           f' --plugins-directory /CellProfiler/plugins')
+           f' --plugins-directory {plugins_dir}')
 
     return cmd

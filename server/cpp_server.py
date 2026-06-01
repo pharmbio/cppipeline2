@@ -359,22 +359,22 @@ def is_debug() -> bool:
     return True
 
 
-def get_hpc_cluster() -> str:
+def get_cluster() -> str:
     """
-    Resolve which HPC cluster/run_location to use.
+    Resolve which cluster/run_location to use.
 
-    Controlled via the HPC_CLUSTER env var, falling back to "pelle".
-    Accepted values include: pelle, hpc_dev, rackham, uppmax, farmbio.
+    Controlled via the CLUSTER env var, falling back to "pelle".
+    Accepted values include: pelle, hpc_dev, rackham, uppmax, pharmbio.
     """
-    env_val = os.environ.get("HPC_CLUSTER")
+    env_val = os.environ.get("CLUSTER")
     if not env_val:
         return "pelle"
 
     cluster = env_val.strip().lower()
-    allowed = {"pelle", "hpc_dev", "rackham", "uppmax", "farmbio"}
+    allowed = {"pelle", "hpc_dev", "rackham", "uppmax", "pharmbio"}
     if cluster not in allowed:
         msg = (
-            f"Invalid HPC_CLUSTER '{cluster}'. "
+            f"Invalid CLUSTER '{cluster}'. "
             f"Allowed values: {', '.join(sorted(allowed))}"
         )
         logging.error(msg)
@@ -704,7 +704,8 @@ def prepare_analysis_cellprofiler_hpc(analysis: Analysis):
             cellprofiler_cmd = hpc_utils.get_cellprofiler_cmd_hpc(analysis.pipeline_file,
                                                                   imageset_file,
                                                                   job_output_path,
-                                                                  job_timeout)
+                                                                  job_timeout,
+                                                                  analysis.plugins_dir)
 
             # Check if icf headers should be added to imgset csv file
             # generate cellprofiler imgset file for this imgset
@@ -1119,13 +1120,71 @@ def handle_finished_analyses(cluster: str) -> None:
 
 
 def run_server_processing() -> None:
+    # Resolve cluster before DB work so misconfiguration fails fast
+    cluster = get_cluster()
+    logging.info("run_server_processing: using cluster=%s", cluster)
+    if cluster == "pharmbio":
+        return run_server_processing_kube(cluster)
+    else:
+        return run_server_processing_hpc(cluster)
+
+
+def run_server_processing_kube(cluster: str) -> None:
     """
     Execute a single server iteration: submit new analyses, pick up finished
     sub-analyses, finalize them, and optionally attempt to finish parent analyses.
     """
-    # Resolve cluster before DB work so misconfiguration fails fast
-    cluster = get_hpc_cluster()
-    logging.info("run_server_processing: using cluster=%s", cluster)
+    try:
+
+        # Submit or prepare new analyses for selected cluster
+        handle_new_analyses(cluster)
+
+        # Scan for finished sub-analyses (for selected cluster) and finalize them
+        finished_subs = fetch_finished_subanalyses_hpc(cluster)
+        for sub_id, job_list in finished_subs.items():
+            if not job_list:
+                logging.warning(f"Finished sub-analysis '{sub_id}' has empty job list; skipping finalize.")
+                continue
+
+            analysis = Database.get_instance().get_analysis(sub_id)
+            if not analysis:
+                logging.warning(f"Analysis for sub_id {sub_id} not found; skipping finalize.")
+                continue
+
+            try:
+                move_job_results_to_storage(analysis, job_list)
+                # Discover files directly from results dir to persist in DB
+                insert_sub_analysis_results_to_db(analysis)
+            except Exception as e:
+                # Log with context and mark this sub-analysis as errored, then continue
+                logging.error(
+                    "finalize sub-analysis failed; sub_id=%s analysis_id=%s",
+                    sub_id,
+                    analysis.id if analysis else None,
+                    exc_info=True,
+                )
+                Database.get_instance().set_sub_analysis_error(analysis, str(e))
+                continue
+
+        # Optionally mark full analyses finished for the selected cluster
+        handle_finished_analyses(cluster)
+
+        # Update database with hpc job status for the selected cluster
+        hpc_utils.update_hpc_job_status(cluster)
+
+    except (psycopg2.Error) as dberr:
+        logging.exception(dberr)
+        logging.error("run_server_processing: database error", exc_info=True)
+    except Exception as e:
+        logging.exception(e)
+        logging.error("run_server_processing failed", exc_info=True)
+
+
+def run_server_processing_hpc(cluster: str) -> None:
+    """
+    Execute a single server iteration: submit new analyses, pick up finished
+    sub-analyses, finalize them, and optionally attempt to finish parent analyses.
+    """
     try:
 
         # Submit or prepare new analyses for selected cluster

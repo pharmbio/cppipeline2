@@ -637,7 +637,7 @@ class Analysis:
         """
         Target run location/cluster key.
 
-        Expected values (string): 'pelle', 'uppmax', 'hpc_dev', 'farmbio', etc.
+        Expected values (string): 'pelle', 'uppmax', 'hpc_dev', 'pharmbio', etc.
         Returns None if not present.
         """
         loc = self._data.get('meta', {}).get('run_location')
@@ -1021,6 +1021,13 @@ class Analysis:
         if not pipeline:
             raise ValueError("Missing required 'pipeline_file' in analysis meta")
         return '/cpp_work/pipelines/' + pipeline
+
+    @property
+    def plugins_dir(self) -> str:
+        plugins_dir = self.meta.get('plugins_dir')
+        if plugins_dir:
+            return '/cpp_work/pipelines/custom_plugins_dirs/' + plugins_dir
+        return '/CellProfiler/plugins'
 
     def timestamp_started(self):
         db = Database.get_instance()
